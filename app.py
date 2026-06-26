@@ -2,7 +2,7 @@
 from flask import Flask, request, jsonify
 
 # Import the init_db function from our database file
-from database import init_db, save_trade, get_all_trades
+from database import init_db, save_trade, get_all_trades, get_statistics
 
 # Create an instance of the Flask app
 # __name__ tells Flask where to look for files related to this app
@@ -49,6 +49,15 @@ def get_trades():
 
     # Return the tades as JSON
     return jsonify(trades), 200
+
+# GET route — returns trading statistics
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    # Get statistics from the database
+    stats = get_statistics()
+    
+    # Return statistics as JSON
+    return jsonify(stats), 200
 
 # Only run the app if this file is being run directly
 if __name__ == '__main__':

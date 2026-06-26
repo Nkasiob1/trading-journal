@@ -67,3 +67,66 @@ def get_all_trades():
     # Return the list of trades
     return trades
   
+# This function calculates trading statistics from all logged trades
+def get_statistics():
+    # Connect to the database
+    conn = sqlite3.connect('goat.db')
+    
+    # Create a cursor
+    cursor = conn.cursor()
+    
+    # Get total number of trades
+    cursor.execute('SELECT COUNT(*) FROM trades')
+    total_trades = cursor.fetchone()[0]
+    
+    # Get number of winning trades
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE result = 'WIN'")
+    total_wins = cursor.fetchone()[0]
+    
+    # Get number of losing trades
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE result = 'LOSS'")
+    total_losses = cursor.fetchone()[0]
+    
+    # Get average R-multiple
+    cursor.execute('SELECT AVG(r_multiple) FROM trades')
+    avg_r = cursor.fetchone()[0]
+    
+    # Get total R gained or lost
+    cursor.execute('SELECT SUM(r_multiple) FROM trades')
+    total_r = cursor.fetchone()[0]
+    
+    # Get London session win rate
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'London'")
+    london_trades = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'London' AND result = 'WIN'")
+    london_wins = cursor.fetchone()[0]
+    
+    # Get New York session win rate
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'New York'")
+    ny_trades = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'New York' AND result = 'WIN'")
+    ny_wins = cursor.fetchone()[0]
+    
+    # Close the connection
+    conn.close()
+    
+    # Calculate win rate safely — avoid dividing by zero
+    win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+    london_win_rate = (london_wins / london_trades * 100) if london_trades > 0 else 0
+    ny_win_rate = (ny_wins / ny_trades * 100) if ny_trades > 0 else 0
+    
+    # Return all statistics as a dictionary
+    return {
+        'total_trades': total_trades,
+        'total_wins': total_wins,
+        'total_losses': total_losses,
+        'win_rate': round(win_rate, 2),
+        'average_r': round(avg_r, 2) if avg_r else 0,
+        'total_r': round(total_r, 2) if total_r else 0,
+        'london_trades': london_trades,
+        'london_win_rate': round(london_win_rate, 2),
+        'ny_trades': ny_trades,
+        'ny_win_rate': round(ny_win_rate, 2)
+    }  
