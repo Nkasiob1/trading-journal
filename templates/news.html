@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GOAT News Feed</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <h1>GOAT Trading Journal</h1>
+    
+    <nav>
+        <a href="/">Journal</a>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/news">News Feed</a>
+    </nav>
+
+    <h2>Today's Forex News</h2>
+    
+    <!-- Loop through articles passed from Flask -->
+    {% for article in articles %}
+    <div class="news-card">
+        <h3><a href="{{ article.url }}" target="_blank">{{ article.title }}</a></h3>
+        <p class="news-meta">{{ article.source }} — {{ article.published }}</p>
+    </div>
+    {% endfor %}
+
+</body>
+</html>

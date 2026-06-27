@@ -4,6 +4,9 @@ from flask import Flask, request, jsonify, render_template
 # Import the init_db function from our database file
 from database import init_db, save_trade, get_all_trades, get_statistics
 
+# Import the news function
+from news import get_forex_news
+
 # Create an instance of the Flask app
 # __name__ tells Flask where to look for files related to this app
 app = Flask(__name__)
@@ -64,6 +67,15 @@ def get_stats():
 def dashboard():
     # Serve the dashboard HTML page
     return render_template('dashboard.html')
+
+# GET route — serves the news feed page
+@app.route('/news')
+def news():
+    # Fetch today's forex news
+    articles = get_forex_news()
+    
+    # Serve the news page with the articles
+    return render_template('news.html', articles=articles)
 
 # Only run the app if this file is being run directly
 if __name__ == '__main__':
