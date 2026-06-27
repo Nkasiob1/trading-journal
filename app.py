@@ -1,5 +1,5 @@
 # Import the Flask class from the flask library we installed
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template 
 
 # Import the init_db function from our database file
 from database import init_db, save_trade, get_all_trades, get_statistics
@@ -15,7 +15,7 @@ init_db()
 @app.route('/')
 def home():
     # This is what gets sent back to the browser when the homepage is visited
-    return 'GOAT Trading Journal is running'
+    return render_template('index.html')
 
 # POST route — accepts trade data and saves it to the database    
 @app.route('/trades', methods=['POST'])
@@ -58,6 +58,12 @@ def get_stats():
     
     # Return statistics as JSON
     return jsonify(stats), 200
+
+# GET route — serves the dashboard page
+@app.route('/dashboard')
+def dashboard():
+    # Serve the dashboard HTML page
+    return render_template('dashboard.html')
 
 # Only run the app if this file is being run directly
 if __name__ == '__main__':

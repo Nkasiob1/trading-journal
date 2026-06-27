@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!-- Character encoding -->
+    <meta charset="UTF-8">
+    
+    <!-- Mobile responsive -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <!-- Browser tab title -->
+    <title>GOAT Dashboard</title>
+    
+    <!-- Link to CSS styling -->
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- Main heading -->
+    <h1>GOAT Dashboard</h1>
+    
+    <!-- Navigation links -->
+    <nav>
+        <a href="/">Journal</a>
+        <a href="/dashboard">Dashboard</a>
+    </nav>
+
+    <!-- Statistics section -->
+    <h2>Performance Stats</h2>
+    <div id="stats">
+        <!-- Stats will be loaded here by JavaScript -->
+        Loading stats...
+    </div>
+
+    <!-- Trade history section -->
+    <h2>Trade History</h2>
+    <table id="tradeTable">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Pair</th>
+                <th>Session</th>
+                <th>Entry</th>
+                <th>Stop Loss</th>
+                <th>Take Profit</th>
+                <th>Result</th>
+                <th>R Multiple</th>
+                <th>Account</th>
+                <th>Date</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody id="tradeBody">
+            <!-- Trades will be loaded here by JavaScript -->
+        </tbody>
+    </table>
+
+    <!-- JavaScript to load stats and trades when page opens -->
+    <script>
+        // Load statistics from the API
+        fetch('/stats')
+        .then(response => response.json())
+        .then(data => {
+            // Build the stats display
+            document.getElementById('stats').innerHTML = `
+                <p>Total Trades: ${data.total_trades}</p>
+                <p>Total Wins: ${data.total_wins}</p>
+                <p>Total Losses: ${data.total_losses}</p>
+                <p>Win Rate: ${data.win_rate}%</p>
+                <p>Average R: ${data.average_r}</p>
+                <p>Total R: ${data.total_r}</p>
+                <p>London Trades: ${data.london_trades} | Win Rate: ${data.london_win_rate}%</p>
+                <p>New York Trades: ${data.ny_trades} | Win Rate: ${data.ny_win_rate}%</p>
+            `;
+        });
+
+        // Load all trades from the API
+        fetch('/trades')
+        .then(response => response.json())
+        .then(trades => {
+            // Get the table body element
+            const tbody = document.getElementById('tradeBody');
+            
+            // Loop through each trade and create a table row
+            trades.forEach(trade => {
+                const row = `<tr>
+                    <td>${trade[0]}</td>
+                    <td>${trade[1]}</td>
+                    <td>${trade[2]}</td>
+                    <td>${trade[3]}</td>
+                    <td>${trade[4]}</td>
+                    <td>${trade[5]}</td>
+                    <td>${trade[6]}</td>
+                    <td>${trade[7]}</td>
+                    <td>${trade[8]}</td>
+                    <td>${trade[9]}</td>
+                    <td>${trade[10]}</td>
+                </tr>`;
+                tbody.innerHTML += row;
+            });
+        });
+    </script>
+
+</body>
+</html>
