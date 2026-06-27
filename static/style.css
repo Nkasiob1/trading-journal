@@ -1,0 +1,158 @@
+/* ── Global Reset & Base Styles ── */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: #1c1208;
+    color: #f0ead6;
+    padding: 20px;
+}
+
+/* ── Headings ── */
+h1 {
+    color: #7a9e7e;
+    font-size: 2rem;
+    margin-bottom: 10px;
+}
+
+h2 {
+    color: #7a9e7e;
+    font-size: 1.3rem;
+    margin: 20px 0 10px 0;
+}
+
+/* ── Navigation ── */
+nav {
+    margin-bottom: 20px;
+}
+
+nav a {
+    color: #a8c5a0;
+    text-decoration: none;
+    margin-right: 20px;
+    font-weight: bold;
+    font-size: 1rem;
+}
+
+nav a:hover {
+    color: #f0ead6;
+    text-decoration: underline;
+}
+
+/* ── Form Styles ── */
+form {
+    background-color: #2a1f10;
+    padding: 20px;
+    border-radius: 8px;
+    max-width: 900px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 15px;
+    border: 1px solid #3d2b15;
+}
+
+label {
+    display: block;
+    color: #b5a48a;
+    font-size: 0.85rem;
+    margin-bottom: 4px;
+}
+
+input, select, textarea {
+    width: 100%;
+    padding: 10px;
+    background-color: #1c1208;
+    border: 1px solid #3d2b15;
+    border-radius: 5px;
+    color: #f0ead6;
+    font-size: 0.95rem;
+}
+
+input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: #7a9e7e;
+}
+
+textarea {
+    resize: vertical;
+    min-height: 80px;
+}
+
+/* ── Button ── */
+button {
+    grid-column: span 2;
+    background-color: #7a9e7e;
+    color: #1c1208;
+    border: none;
+    padding: 12px;
+    border-radius: 5px;
+    font-size: 1rem;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+button:hover {
+    background-color: #5c7a60;
+}
+
+/* ── Message ── */
+#message {
+    margin-top: 15px;
+    color: #7a9e7e;
+    font-weight: bold;
+}
+
+/* ── Stats Section ── */
+#stats {
+    background-color: #2a1f10;
+    padding: 20px;
+    border-radius: 8px;
+    max-width: 600px;
+    margin-bottom: 20px;
+    border: 1px solid #3d2b15;
+}
+
+#stats p {
+    margin-bottom: 8px;
+    font-size: 0.95rem;
+    color: #f0ead6;
+}
+
+/* ── Trade History Table ── */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    font-size: 0.85rem;
+}
+
+th {
+    background-color: #3d2b15;
+    color: #a8c5a0;
+    padding: 10px;
+    text-align: left;
+    border-bottom: 2px solid #7a9e7e;
+}
+
+td {
+    padding: 10px;
+    border-bottom: 1px solid #2a1f10;
+    color: #f0ead6;
+}
+
+tr:hover {
+    background-color: #2a1f10;
+}
+
+/* ── Subtle blue accent for links only ── */
+a {
+    color: #7a9eb5;
+}
+
+a:hover {
+    color: #f0ead6;
+}
