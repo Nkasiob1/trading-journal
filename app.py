@@ -20,11 +20,17 @@ def home():
     # This is what gets sent back to the browser when the homepage is visited
     return render_template('index.html')
 
-# POST route — accepts trade data and saves it to the database    
 @app.route('/trades', methods=['POST'])
 def add_trade():
     # Get the JSON data sent in the request body
     data = request.get_json()
+
+    # Validate that all required fields are present
+    required_fields = ['pair', 'session', 'entry', 'stop_loss', 'take_profit', 'result', 'r_multiple', 'account', 'date']
+    for field in required_fields:
+        if field not in data:
+            # Return a 400 Bad Request response if a field is missing
+            return jsonify({'error': f'Missing required field: {field}'}), 400
 
     # Extract each field from the data
     pair = data['pair']
@@ -38,9 +44,9 @@ def add_trade():
     date = data['date']
     notes = data.get('notes', '')
 
-    # Save the trades to database 
+    # Save the trade to the database
     save_trade(pair, session, entry, stop_loss, take_profit, result, r_multiple, account, date, notes)
-      
+
     # Return a success response
     return jsonify({'message': 'Trade saved successfully'}), 201
 
