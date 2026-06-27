@@ -1,1 +1,7 @@
+goat.db
+test_goat.db
+__pycache__/
+venv/
 .env
+.pytest_cache/
+*.pyc
