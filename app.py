@@ -86,4 +86,4 @@ def news():
 # Only run the app if this file is being run directly
 if __name__ == '__main__':
     # Start the Flask web server with debug=True
-    app.run(debug=True)
+    app.run(host='0.0.0.0', debug=True)
