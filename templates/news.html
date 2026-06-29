@@ -16,9 +16,16 @@
         <a href="/news">News Feed</a>
     </nav>
 
+    <h2>Today's Trade Verdict</h2>
+    
+    <!-- Trade day verdict card -->
+    <div class="verdict-card verdict-{{ verdict.color }}">
+        <h3>{{ verdict.emoji }} {{ verdict.verdict }}</h3>
+        <p>{{ verdict.reason }}</p>
+    </div>
+
     <h2>Today's Forex News</h2>
     
-    <!-- Loop through articles passed from Flask -->
     {% for article in articles %}
     <div class="news-card">
         <h3><a href="{{ article.url }}" target="_blank">{{ article.title }}</a></h3>

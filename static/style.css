@@ -156,3 +156,60 @@ a {
 a:hover {
     color: #f0ead6;
 }
+
+/* ── Verdict Card ── */
+.verdict-card {
+    padding: 20px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    max-width: 600px;
+}
+
+.verdict-green {
+    background-color: #1a2e1a;
+    border: 2px solid #7a9e7e;
+}
+
+.verdict-red {
+    background-color: #2e1a1a;
+    border: 2px solid #9e4a4a;
+}
+
+.verdict-orange {
+    background-color: #2e2a1a;
+    border: 2px solid #9e8a4a;
+}
+
+.verdict-card h3 {
+    font-size: 1.3rem;
+    margin-bottom: 8px;
+}
+
+/* ── News Cards ── */
+.news-card {
+    background-color: #2a1f10;
+    padding: 15px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+    border: 1px solid #3d2b15;
+    max-width: 800px;
+}
+
+.news-card h3 {
+    font-size: 0.95rem;
+    margin-bottom: 5px;
+}
+
+.news-card a {
+    color: #a8c5a0;
+    text-decoration: none;
+}
+
+.news-card a:hover {
+    color: #f0ead6;
+}
+
+.news-meta {
+    font-size: 0.8rem;
+    color: #b5a48a;
+}

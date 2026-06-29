@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify, render_template
 from database import init_db, save_trade, get_all_trades, get_statistics
 
 # Import the news function
-from news import get_forex_news
+from news import get_forex_news, get_trade_verdict
 
 # Create an instance of the Flask app
 # __name__ tells Flask where to look for files related to this app
@@ -80,8 +80,12 @@ def news():
     # Fetch today's forex news
     articles = get_forex_news()
     
-    # Serve the news page with the articles
-    return render_template('news.html', articles=articles)
+    # Get the trade day verdict
+    from news import get_trade_verdict
+    verdict = get_trade_verdict(articles)
+    
+    # Serve the news page with articles and verdict
+    return render_template('news.html', articles=articles, verdict=verdict)
 
 # Only run the app if this file is being run directly
 if __name__ == '__main__':
