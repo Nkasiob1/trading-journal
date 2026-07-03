@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: goat-trading-journal
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: NEWS_API_KEY
+        sync: false
+      - key: EMAIL_ADDRESS
+        sync: false
+      - key: BREVO_SMTP_SERVER
+        sync: false
+      - key: BREVO_PORT
+        sync: false
+      - key: BREVO_LOGIN
+        sync: false
+      - key: BREVO_PASSWORD
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
