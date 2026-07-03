@@ -28,6 +28,69 @@ ACCOUNTS = {
     }
 }
 
+# ── KILL SWITCH CONFIGURATION ──
+MAX_CONSECUTIVE_LOSSES = 3      # Pause after 3 consecutive losses
+KILL_SWITCH_HOURS = 24          # Hours to pause after kill switch triggers
+MAX_WEEKLY_LOSSES = 5           # Stop trading for the week after 5 losses
+
+def check_kill_switch(consecutive_losses, last_loss_timestamp=None):
+    """
+    Checks if the kill switch has been triggered.
+    
+    Triggers if:
+    - 3 or more consecutive losses recorded
+    - Within the 24 hour cooldown period
+    
+    Args:
+        consecutive_losses: number of losses in a row
+        last_loss_timestamp: datetime of the last loss (WAT)
+    
+    Returns:
+        dict with kill switch status and reason
+    """
+    # Check consecutive losses
+    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+        # Check if 24 hours have passed since last loss
+        if last_loss_timestamp:
+            now = datetime.now(WAT)
+            # Convert string timestamp to datetime if needed
+            if isinstance(last_loss_timestamp, str):
+                last_loss = datetime.strptime(
+                    last_loss_timestamp, '%Y-%m-%d %H:%M WAT'
+                ).replace(tzinfo=WAT)
+            else:
+                last_loss = last_loss_timestamp
+            
+            hours_since_loss = (now - last_loss).total_seconds() / 3600
+            
+            if hours_since_loss < KILL_SWITCH_HOURS:
+                remaining = round(KILL_SWITCH_HOURS - hours_since_loss, 1)
+                return {
+                    'triggered': True,
+                    'reason': f"Kill switch active — {consecutive_losses} consecutive losses detected. {remaining} hours remaining before trading resumes.",
+                    'hours_remaining': remaining,
+                    'consecutive_losses': consecutive_losses
+                }
+            else:
+                # 24 hours passed — kill switch resets
+                return {
+                    'triggered': False,
+                    'reason': f"Kill switch cooldown complete — 24 hours passed since last loss. Trading permitted.",
+                    'consecutive_losses': consecutive_losses
+                }
+        else:
+            return {
+                'triggered': True,
+                'reason': f"Kill switch active — {consecutive_losses} consecutive losses. No timestamp available — pause trading manually for 24 hours.",
+                'consecutive_losses': consecutive_losses
+            }
+    
+    return {
+        'triggered': False,
+        'reason': f"Kill switch inactive — {consecutive_losses} consecutive losses (threshold: {MAX_CONSECUTIVE_LOSSES})",
+        'consecutive_losses': consecutive_losses
+    }
+
 # ── CONFIDENCE SCORING WEIGHTS ──
 # Each rule is assigned a weight reflecting its importance
 # Total possible score = 100
@@ -539,7 +602,9 @@ def run_bot(
     liquidity_swept,
     bos_confirmed,
     sl_points,
-    tp_points
+    tp_points,
+    consecutive_losses=0,
+    last_loss_timestamp=None
 ):
     """
     Main entry point for the GOAT trading bot rule engine.
@@ -552,6 +617,23 @@ def run_bot(
     print(f"Time: {datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')}")
     print(f"Account: {account_name} | Pair: {pair} | Direction: {direction.upper()}")
     print("="*60)
+
+    # ── KILL SWITCH CHECK ──
+    # Must be first check — overrides everything including account status
+    kill_switch = check_kill_switch(
+        consecutive_losses=consecutive_losses,
+        last_loss_timestamp=last_loss_timestamp
+    )
+    if kill_switch['triggered']:
+        report = {
+            'signal': 'NO TRADE — KILL SWITCH ACTIVE',
+            'valid': False,
+            'reason': kill_switch['reason'],
+            'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
+        }
+        print(f"\n🔴 {report['signal']}")
+        print(f"Reason: {report['reason']}")
+        return report
 
     if is_weekend():
         report = {
@@ -751,3 +833,27 @@ if __name__ == '__main__':
     for check_name, check_result in result3['checklist'].items():
         if 'passed' in check_result and not check_result['passed']:
             print(f"  ❌ {check_name}: {check_result['reason']}")
+
+    print("\n=== TEST 4: KILL SWITCH TRIGGERED ===")
+    kill_result = run_bot(
+        account_name='Account 2',
+        today_loss=0,
+        total_drawdown=0,
+        pair='EURUSD',
+        direction='sell',
+        weekly_bias='bearish',
+        bias_4h='bearish',
+        sma_50_slope='down',
+        zone='premium',
+        smt_agreement=True,
+        smt_divergence=False,
+        fvg_or_ob=True,
+        liquidity_swept=True,
+        bos_confirmed=True,
+        sl_points=300,
+        tp_points=600,
+        consecutive_losses=3,
+        last_loss_timestamp='2026-07-03 10:00 WAT'
+    )
+    print(f"\nSIGNAL: {kill_result['signal']}")
+    print(f"Reason: {kill_result['reason']}")
