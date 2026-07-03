@@ -1,6 +1,7 @@
 # bot.py
 # GOAT Trading Bot - Rule Engine
 # Built strictly according to documented Silver Bullet strategy
+# Version 2.0 — Confidence Scoring Added
 
 from datetime import datetime, time as dtime
 import pytz
@@ -27,8 +28,36 @@ ACCOUNTS = {
     }
 }
 
+# ── CONFIDENCE SCORING WEIGHTS ──
+# Each rule is assigned a weight reflecting its importance
+# Total possible score = 100
+# Trade only if confidence >= 85
+
+RULE_WEIGHTS = {
+    'account_status':       0,   # Hard stop
+    'news_check':           10,
+    'market_open':          0,   # Hard stop
+    'silver_bullet_window': 0,   # Hard stop
+    'zone':                 0,   # Hard stop — NEVER buy premium, NEVER sell discount
+    'weekly_bias':          25,  # Increased to maintain 100 total
+    'bias_4h':              20,
+    'smt':                  15,
+    'price_action_5m':      20,
+    'rr_ratio':             10,
+}
+
+# Minimum confidence required to take a trade
+MIN_CONFIDENCE = 85
+
+# News confidence penalty
+CATEGORY_2_PENALTY = 5  # Caution news reduces confidence by 5 points
+
 # ── LAYER 1: ACCOUNT RISK STATE ──
 def check_account_status(account_name, today_loss, total_drawdown):
+    """
+    Checks if an account is allowed to trade based on drawdown rules.
+    Returns a dict with status and reason.
+    """
     account = ACCOUNTS[account_name]
     if total_drawdown >= account['total_drawdown_limit']:
         return {
@@ -72,6 +101,10 @@ CATEGORY_2_KEYWORDS = [
 ]
 
 def check_news_status():
+    """
+    Checks today's news for Category 1 and Category 2 events.
+    Returns a dict with trading permission and reason.
+    """
     try:
         articles = get_forex_news()
         all_headlines = ' '.join([
@@ -128,6 +161,10 @@ SILVER_BULLET_WINDOWS = {
 }
 
 def check_silver_bullet_window():
+    """
+    Checks if the current WAT time falls inside any Silver Bullet window.
+    Returns which session is active, or None if outside all windows.
+    """
     now = datetime.now(WAT)
     current_time = now.time()
     for session_name, window in SILVER_BULLET_WINDOWS.items():
@@ -161,10 +198,12 @@ def check_silver_bullet_window():
     }
 
 def is_weekend():
+    """Checks if today is Saturday or Sunday."""
     now = datetime.now(WAT)
     return now.weekday() in [5, 6]
 
 def is_friday_close():
+    """Checks if it is past 22:00 WAT on Friday."""
     now = datetime.now(WAT)
     if now.weekday() == 4 and now.hour >= 22:
         return True
@@ -182,6 +221,11 @@ MIN_LOT = 0.01
 MAX_LOT = 0.10
 
 def calculate_lot_size(pair, sl_points, account_name):
+    """
+    Calculates the correct lot size based on fixed $10 risk
+    and actual structural SL distance in points.
+    Always rounds DOWN — never rounds up on risk.
+    """
     if sl_points <= 0:
         return {
             'valid': False,
@@ -222,6 +266,7 @@ def calculate_lot_size(pair, sl_points, account_name):
     }
 
 def verify_rr_ratio(sl_points, tp_points):
+    """Verifies that the trade meets the minimum 1:2 R:R requirement."""
     if sl_points <= 0 or tp_points <= 0:
         return {
             'valid': False,
@@ -238,6 +283,69 @@ def verify_rr_ratio(sl_points, tp_points):
         'valid': True,
         'actual_ratio': round(actual_ratio, 2),
         'reason': f'R:R ratio verified: 1:{round(actual_ratio, 2)} — meets minimum 1:2 requirement'
+    }
+
+# ── CONFIDENCE SCORE CALCULATOR ──
+
+def calculate_confidence(checklist_results, news_caution=False):
+    """
+    Calculates a confidence score from 0-100 based on weighted rule results.
+    Hard stops are not scored — they must pass regardless.
+    Trade only if confidence >= 85.
+    """
+    total_score = 0
+    max_possible = sum(w for rule, w in RULE_WEIGHTS.items() if w > 0)
+    scored_rules = {}
+
+    for rule, weight in RULE_WEIGHTS.items():
+        if weight == 0:
+            continue
+        if rule not in checklist_results:
+            continue
+        result = checklist_results[rule]
+        if 'passed' in result and result['passed']:
+            total_score += weight
+            scored_rules[rule] = {
+                'weight': weight,
+                'earned': weight,
+                'passed': True
+            }
+        else:
+            scored_rules[rule] = {
+                'weight': weight,
+                'earned': 0,
+                'passed': False
+            }
+
+    # Apply Category 2 news penalty
+    if news_caution:
+        total_score = max(0, total_score - CATEGORY_2_PENALTY)
+
+    confidence = round((total_score / max_possible) * 100, 1)
+
+    if confidence >= 95:
+        grade = 'A+'
+        recommendation = 'EXCEPTIONAL SETUP — HIGH CONVICTION TRADE'
+    elif confidence >= 90:
+        grade = 'A'
+        recommendation = 'STRONG SETUP — TAKE THE TRADE'
+    elif confidence >= 85:
+        grade = 'B'
+        recommendation = 'GOOD SETUP — TAKE THE TRADE'
+    elif confidence >= 75:
+        grade = 'C'
+        recommendation = 'MARGINAL SETUP — STAND ASIDE'
+    else:
+        grade = 'D'
+        recommendation = 'WEAK SETUP — DO NOT TRADE'
+
+    return {
+        'score': confidence,
+        'grade': grade,
+        'recommendation': recommendation,
+        'meets_threshold': confidence >= MIN_CONFIDENCE,
+        'scored_rules': scored_rules,
+        'news_caution_applied': news_caution
     }
 
 # ── LAYER 5: TRADE CHECKLIST EVALUATOR ──
@@ -260,6 +368,10 @@ def evaluate_checklist(
     sl_points,
     tp_points,
 ):
+    """
+    Evaluates all checklist conditions from the Silver Bullet strategy.
+    ALL hard stops must pass AND confidence must be >= 85.
+    """
     results = {}
 
     # BOX 1: ACCOUNT RISK STATUS
@@ -362,11 +474,20 @@ def evaluate_checklist(
         'details': lot_calc
     }
 
+    # CONFIDENCE SCORE
+    news_caution = results.get('news_check', {}).get('caution', False)
+    confidence = calculate_confidence(results, news_caution)
+
     # FINAL VERDICT
-    all_passed = all(
-        v['passed'] for v in results.values()
-        if 'passed' in v
-    ) and lot_calc['valid']
+    hard_stops_passed = all([
+    results.get('account_status', {}).get('passed', False),
+    results.get('market_open', {}).get('passed', False),
+    results.get('silver_bullet_window', {}).get('passed', False),
+    results.get('news_check', {}).get('passed', False),
+    results.get('zone', {}).get('passed', False),  # Added
+ ])
+
+    all_passed = hard_stops_passed and confidence['meets_threshold']
 
     passed_count = sum(
         1 for v in results.values()
@@ -384,6 +505,9 @@ def evaluate_checklist(
         'valid': all_passed,
         'passed': passed_count,
         'total': total_count,
+        'confidence': confidence['score'],
+        'grade': confidence['grade'],
+        'recommendation': confidence['recommendation'],
         'pair': pair,
         'direction': direction,
         'account': account_name,
@@ -393,6 +517,7 @@ def evaluate_checklist(
         'risk_amount': lot_calc.get('risk_amount') if lot_calc['valid'] else None,
         'expected_reward': lot_calc.get('expected_reward') if lot_calc['valid'] else None,
         'checklist': results,
+        'confidence_breakdown': confidence['scored_rules'],
         'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
     }
 
@@ -416,8 +541,13 @@ def run_bot(
     sl_points,
     tp_points
 ):
+    """
+    Main entry point for the GOAT trading bot rule engine.
+    Runs the complete decision tree from the Silver Bullet strategy.
+    Does NOT execute trades yet — that is Session 11.
+    """
     print("\n" + "="*60)
-    print("GOAT TRADING BOT — RULE ENGINE")
+    print("GOAT TRADING BOT — RULE ENGINE v2.0")
     print("="*60)
     print(f"Time: {datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')}")
     print(f"Account: {account_name} | Pair: {pair} | Direction: {direction.upper()}")
@@ -511,6 +641,8 @@ def run_bot(
             status = "✅" if check_result['passed'] else "❌"
             print(f"{status} {check_name.upper().replace('_', ' ')}: {check_result['reason']}")
 
+    print(f"\n── CONFIDENCE: {result['confidence']}/100 — Grade {result['grade']} ──")
+    print(f"── {result['recommendation']} ──")
     print(f"\n── RESULT: {result['passed']}/{result['total']} checks passed ──")
 
     if result['valid']:
@@ -553,6 +685,8 @@ if __name__ == '__main__':
         tp_points=600
     )
     print(f"\nSIGNAL: {result['signal']}")
+    print(f"Confidence: {result['confidence']}/100 — Grade {result['grade']}")
+    print(f"Recommendation: {result['recommendation']}")
     print(f"Checks passed: {result['passed']}/{result['total']}")
     if result['valid']:
         print(f"Lot size: {result['lot_size']} lots")
@@ -582,6 +716,8 @@ if __name__ == '__main__':
         tp_points=600
     )
     print(f"\nSIGNAL: {result2['signal']}")
+    print(f"Confidence: {result2['confidence']}/100 — Grade {result2['grade']}")
+    print(f"Recommendation: {result2['recommendation']}")
     print(f"Checks passed: {result2['passed']}/{result2['total']}")
     print("\nFailed checks:")
     for check_name, check_result in result2['checklist'].items():
@@ -608,6 +744,8 @@ if __name__ == '__main__':
         tp_points=600
     )
     print(f"\nSIGNAL: {result3['signal']}")
+    print(f"Confidence: {result3['confidence']}/100 — Grade {result3['grade']}")
+    print(f"Recommendation: {result3['recommendation']}")
     print(f"Checks passed: {result3['passed']}/{result3['total']}")
     print("\nFailed checks:")
     for check_name, check_result in result3['checklist'].items():
