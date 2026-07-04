@@ -10,10 +10,6 @@ COPY requirements.txt .
 # Install all dependencies from requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright and Chromium
-RUN pip install playwright
-RUN playwright install --with-deps chromium
-
 # Copy all project files into the container
 COPY . .
 
