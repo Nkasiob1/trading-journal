@@ -1,38 +1,89 @@
-# Import the Flask class from the flask library we installed
-from flask import Flask, request, jsonify, render_template 
+# Import Flask and required tools
+from flask import Flask, request, jsonify, render_template, redirect, url_for
+from flask_login import login_required, login_user, logout_user
 
-# Import the init_db function from our database file
+# Import database functions
 from database import init_db, save_trade, get_all_trades, get_statistics
 
-# Import the news function
+# Import news functions
 from news import get_forex_news, get_trade_verdict
 
-# Create an instance of the Flask app
-# __name__ tells Flask where to look for files related to this app
+# Import authentication
+from auth import login_manager, check_credentials, goat_user
+
+# Import os for environment variables
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Create Flask app
 app = Flask(__name__)
 
-# Initialize the database when the app starts
+# Secret key required for session management
+# Used to encrypt the login session cookie
+app.secret_key = os.getenv('GOAT_SECRET_KEY', 'goat-trading-journal-secret-2026')
+
+# Initialize login manager
+login_manager.init_app(app)
+
+# Initialize database
 init_db()
 
-# This decorator tells Flask that when someone visits '/' run the function below
+# ── AUTHENTICATION ROUTES ──
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+
+        if check_credentials(username, password):
+            login_user(goat_user)
+            return redirect(url_for('home'))
+        else:
+            return render_template('login.html', error='Invalid username or password')
+
+    return render_template('login.html', error=None)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+# ── MAIN ROUTES ──
+
 @app.route('/')
+@login_required
 def home():
-    # This is what gets sent back to the browser when the homepage is visited
     return render_template('index.html')
 
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    return render_template('dashboard.html')
+
+@app.route('/news')
+@login_required
+def news():
+    articles = get_forex_news()
+    verdict = get_trade_verdict(articles)
+    return render_template('news.html', articles=articles, verdict=verdict)
+
+# ── API ROUTES ──
+
 @app.route('/trades', methods=['POST'])
+@login_required
 def add_trade():
-    # Get the JSON data sent in the request body
     data = request.get_json()
 
-    # Validate that all required fields are present
-    required_fields = ['pair', 'session', 'entry', 'stop_loss', 'take_profit', 'result', 'r_multiple', 'account', 'date']
+    required_fields = ['pair', 'session', 'entry', 'stop_loss',
+                       'take_profit', 'result', 'r_multiple', 'account', 'date']
     for field in required_fields:
         if field not in data:
-            # Return a 400 Bad Request response if a field is missing
             return jsonify({'error': f'Missing required field: {field}'}), 400
 
-    # Extract each field from the data
     pair = data['pair']
     session = data['session']
     entry = data['entry']
@@ -44,50 +95,23 @@ def add_trade():
     date = data['date']
     notes = data.get('notes', '')
 
-    # Save the trade to the database
-    save_trade(pair, session, entry, stop_loss, take_profit, result, r_multiple, account, date, notes)
+    save_trade(pair, session, entry, stop_loss, take_profit,
+               result, r_multiple, account, date, notes)
 
-    # Return a success response
     return jsonify({'message': 'Trade saved successfully'}), 201
 
-# Get route - retrieves all trade from the database 
 @app.route('/trades', methods=['GET'])
+@login_required
 def get_trades():
-    # get all trades from the database
     trades = get_all_trades()
-
-    # Return the tades as JSON
     return jsonify(trades), 200
 
-# GET route — returns trading statistics
 @app.route('/stats', methods=['GET'])
+@login_required
 def get_stats():
-    # Get statistics from the database
     stats = get_statistics()
-    
-    # Return statistics as JSON
     return jsonify(stats), 200
 
-# GET route — serves the dashboard page
-@app.route('/dashboard')
-def dashboard():
-    # Serve the dashboard HTML page
-    return render_template('dashboard.html')
-
-# GET route — serves the news feed page
-@app.route('/news')
-def news():
-    # Fetch today's forex news
-    articles = get_forex_news()
-    
-    # Get the trade day verdict
-    from news import get_trade_verdict
-    verdict = get_trade_verdict(articles)
-    
-    # Serve the news page with articles and verdict
-    return render_template('news.html', articles=articles, verdict=verdict)
-
-# Only run the app if this file is being run directly
+# ── RUN ──
 if __name__ == '__main__':
-    # Start the Flask web server with debug=True
     app.run(host='0.0.0.0', debug=True)

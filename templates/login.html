@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GOAT — Login</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        .login-container {
+            max-width: 400px;
+            margin: 100px auto;
+            background-color: #2a1f10;
+            padding: 40px;
+            border-radius: 8px;
+            border: 1px solid #3d2b15;
+        }
+        .login-container h2 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #7a9e7e;
+        }
+        .login-container label {
+            display: block;
+            margin-bottom: 5px;
+            color: #b5a48a;
+        }
+        .login-container input {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 20px;
+            background-color: #1c1208;
+            border: 1px solid #3d2b15;
+            border-radius: 5px;
+            color: #f0ead6;
+            font-size: 1rem;
+        }
+        .login-container button {
+            width: 100%;
+            padding: 12px;
+            background-color: #7a9e7e;
+            color: #1c1208;
+            border: none;
+            border-radius: 5px;
+            font-size: 1rem;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .login-container button:hover {
+            background-color: #5c7a60;
+        }
+        .error {
+            color: #9e4a4a;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .logo {
+            text-align: center;
+            font-size: 2rem;
+            font-weight: bold;
+            color: #7a9e7e;
+            margin-bottom: 10px;
+        }
+        .tagline {
+            text-align: center;
+            color: #b5a48a;
+            font-size: 0.85rem;
+            margin-bottom: 30px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="logo">GOAT</div>
+        <div class="tagline">Greatest Of All Trades</div>
+        
+        <h2>Sign In</h2>
+        
+        {% if error %}
+        <p class="error">{{ error }}</p>
+        {% endif %}
+        
+        <form method="POST" action="/login">
+            <label>Username:</label>
+            <input type="text" name="username" placeholder="Enter username" required>
+            
+            <label>Password:</label>
+            <input type="password" name="password" placeholder="Enter password" required>
+            
+            <button type="submit">Login</button>
+        </form>
+    </div>
+</body>
+</html>
