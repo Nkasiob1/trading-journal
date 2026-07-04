@@ -4,14 +4,21 @@ FROM python:3.11-slim
 # Set the working directory inside the container
 WORKDIR /app
 
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install all dependencies from requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright and Chromium
+RUN pip install playwright
+RUN playwright install --with-deps chromium
+
 # Copy all project files into the container
 COPY . .
 
-# Install all Python dependencies
-RUN pip install flask requests python-dotenv pytest
-
-# Expose port 5000 so the browser can reach the Flask app
+# Expose port 5000
 EXPOSE 5000
 
-# Run the Flask app when the container starts
+# Run the Flask app
 CMD ["python", "app.py"]
