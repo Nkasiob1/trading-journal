@@ -83,8 +83,25 @@
             <label>Username:</label>
             <input type="text" name="username" placeholder="Enter username" required>
             
-            <label>Password:</label>
-            <input type="password" name="password" placeholder="Enter password" required>
+           <label>Password:</label>
+<div style="position:relative;">
+    <input type="password" name="password" id="password" placeholder="Enter password" required style="width:100%; padding:10px; background-color:#1c1208; border:1px solid #3d2b15; border-radius:5px; color:#f0ead6; font-size:1rem;">
+    <span onclick="togglePassword()" style="position:absolute; right:10px; top:50%; transform:translateY(-50%); cursor:pointer; color:#b5a48a; font-size:0.85rem;">Show</span>
+</div>
+
+<script>
+function togglePassword() {
+    const pwd = document.getElementById('password');
+    const span = pwd.nextElementSibling;
+    if (pwd.type === 'password') {
+        pwd.type = 'text';
+        span.innerText = 'Hide';
+    } else {
+        pwd.type = 'password';
+        span.innerText = 'Show';
+    }
+}
+</script>
             
             <button type="submit">Login</button>
         </form>
