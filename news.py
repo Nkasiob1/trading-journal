@@ -96,3 +96,73 @@ def get_trade_verdict(news_list):
         'reason': 'No high impact events detected in today\'s headlines',
         'emoji': '🟢'
     }
+from datetime import datetime, timedelta
+import pytz
+
+UTC = pytz.UTC
+# ── STATIC ECONOMIC CALENDAR ──
+# No external API -- a manually maintained list of known high/medium-impact events.
+# UPDATE THIS MONTHLY: check forexfactory.com/calendar (or any public economic calendar)
+# once a month, add upcoming NFP/CPI/FOMC/BoE/ECB dates. Takes about 5 minutes.
+#
+# Format: (date 'YYYY-MM-DD', time_utc 'HH:MM', event_name, impact 'high' or 'medium')
+#
+# IMPORTANT: this list starts EMPTY. Until you populate it, the bot has NO calendar
+# protection at all -- it will not block trading around any scheduled news event.
+STATIC_BLACKOUT_EVENTS = [
+    # ('2026-07-04', '12:30', 'US Non-Farm Payrolls', 'high'),
+    # ('2026-07-15', '12:30', 'US CPI', 'high'),
+    # ('2026-07-30', '18:00', 'FOMC Rate Decision', 'high'),
+]
+
+def get_economic_calendar(target_date=None):
+    # target_date: a date object, defaults to today (UTC). Filters STATIC_BLACKOUT_EVENTS
+    # down to just events on this specific date.
+    if target_date is None:
+        target_date = datetime.now(UTC).date()
+
+    target_date_str = target_date.isoformat()
+    matching_events = []
+    for event_date, event_time, event_name, impact in STATIC_BLACKOUT_EVENTS:
+        if event_date == target_date_str:
+            matching_events.append({
+                'time': f"{event_date} {event_time}:00",
+                'event': event_name,
+                'impact': impact,
+                'country': 'US',  # not currently distinguishing by country -- all treated as relevant
+            })
+    return matching_events
+
+def check_economic_calendar_blackout(now_utc=None, blackout_before_min=30, blackout_after_min=30):
+    # unchanged logic -- checks if "now" falls within a blackout window around any event.
+    # Only the SOURCE of events changed (static list instead of a live API call).
+    now_utc = now_utc if now_utc else datetime.now(UTC)
+    events = get_economic_calendar(now_utc.date())
+
+    for event in events:
+        impact = str(event.get('impact', '')).lower()
+        if impact not in ('high', 'medium'):
+            continue
+
+        event_time_str = event.get('time')
+        if not event_time_str:
+            continue
+
+        try:
+            event_time = datetime.strptime(event_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=UTC)
+        except ValueError:
+            continue
+
+        window_start = event_time - timedelta(minutes=blackout_before_min)
+        window_end = event_time + timedelta(minutes=blackout_after_min)
+
+        if window_start <= now_utc <= window_end:
+            severity = 'NO TRADE' if impact == 'high' else 'CAUTION'
+            return {
+                'in_blackout': True, 'severity': severity,
+                'event': event.get('event', 'Unknown event'),
+                'event_time_utc': event_time.isoformat(),
+                'reason': f"{severity}: {event.get('event')} scheduled at {event_time.strftime('%H:%M UTC')}",
+            }
+
+    return {'in_blackout': False, 'severity': None, 'reason': 'No high/medium impact events in blackout window'}

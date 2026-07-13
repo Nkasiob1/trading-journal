@@ -62,6 +62,13 @@
         fetch('/stats')
         .then(response => response.json())
         .then(data => {
+            // build the per-session breakdown dynamically -- works for any number of sessions,
+            // not hardcoded to just London/New York anymore
+            let sessionHtml = '';
+            for (const [sessionName, stats] of Object.entries(data.session_stats)) {
+                sessionHtml += `<p>${sessionName}: ${stats.trades} trades | Win Rate: ${stats.win_rate}%</p>`;
+            }
+
             // Build the stats display
             document.getElementById('stats').innerHTML = `
                 <p>Total Trades: ${data.total_trades}</p>
@@ -70,8 +77,7 @@
                 <p>Win Rate: ${data.win_rate}%</p>
                 <p>Average R: ${data.average_r}</p>
                 <p>Total R: ${data.total_r}</p>
-                <p>London Trades: ${data.london_trades} | Win Rate: ${data.london_win_rate}%</p>
-                <p>New York Trades: ${data.ny_trades} | Win Rate: ${data.ny_win_rate}%</p>
+                ${sessionHtml}
             `;
         });
 

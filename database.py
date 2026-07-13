@@ -71,53 +71,54 @@ def get_all_trades():
 def get_statistics():
     # Connect to the database
     conn = sqlite3.connect('goat.db')
-    
-    # Create a cursor
     cursor = conn.cursor()
-    
+
     # Get total number of trades
     cursor.execute('SELECT COUNT(*) FROM trades')
     total_trades = cursor.fetchone()[0]
-    
+
     # Get number of winning trades
     cursor.execute("SELECT COUNT(*) FROM trades WHERE result = 'WIN'")
     total_wins = cursor.fetchone()[0]
-    
+
     # Get number of losing trades
     cursor.execute("SELECT COUNT(*) FROM trades WHERE result = 'LOSS'")
     total_losses = cursor.fetchone()[0]
-    
+
     # Get average R-multiple
     cursor.execute('SELECT AVG(r_multiple) FROM trades')
     avg_r = cursor.fetchone()[0]
-    
+
     # Get total R gained or lost
     cursor.execute('SELECT SUM(r_multiple) FROM trades')
     total_r = cursor.fetchone()[0]
-    
-    # Get London session win rate
-    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'London'")
-    london_trades = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'London' AND result = 'WIN'")
-    london_wins = cursor.fetchone()[0]
-    
-    # Get New York session win rate
-    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'New York'")
-    ny_trades = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM trades WHERE session = 'New York' AND result = 'WIN'")
-    ny_wins = cursor.fetchone()[0]
-    
-    # Close the connection
+
+    # NEW: instead of hardcoding 'London' and 'New York', ask the database which
+    # session names actually exist in the trades table -- works for any number of sessions
+    cursor.execute('SELECT DISTINCT session FROM trades')
+    all_sessions = [row[0] for row in cursor.fetchall()]  # e.g. ['Asian KZ', 'London Open KZ', ...]
+
+    # build a win-rate breakdown for EVERY session that actually has trades, not just two
+    session_stats = {}  # will look like {'Asian KZ': {'trades': 5, 'wins': 3, 'win_rate': 60.0}, ...}
+    for session_name in all_sessions:
+        cursor.execute('SELECT COUNT(*) FROM trades WHERE session = ?', (session_name,))
+        session_trades = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE session = ? AND result = 'WIN'", (session_name,))
+        session_wins = cursor.fetchone()[0]
+
+        session_win_rate = (session_wins / session_trades * 100) if session_trades > 0 else 0
+        session_stats[session_name] = {
+            'trades': session_trades,
+            'wins': session_wins,
+            'win_rate': round(session_win_rate, 2),
+        }
+
     conn.close()
-    
-    # Calculate win rate safely — avoid dividing by zero
+
+    # Calculate overall win rate safely -- avoid dividing by zero
     win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
-    london_win_rate = (london_wins / london_trades * 100) if london_trades > 0 else 0
-    ny_win_rate = (ny_wins / ny_trades * 100) if ny_trades > 0 else 0
-    
-    # Return all statistics as a dictionary
+
     return {
         'total_trades': total_trades,
         'total_wins': total_wins,
@@ -125,8 +126,5 @@ def get_statistics():
         'win_rate': round(win_rate, 2),
         'average_r': round(avg_r, 2) if avg_r else 0,
         'total_r': round(total_r, 2) if total_r else 0,
-        'london_trades': london_trades,
-        'london_win_rate': round(london_win_rate, 2),
-        'ny_trades': ny_trades,
-        'ny_win_rate': round(ny_win_rate, 2)
-    }  
+        'session_stats': session_stats,   # NEW: replaces the old london_trades/ny_trades fields
+    }

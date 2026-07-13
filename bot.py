@@ -1,7 +1,21 @@
 # bot.py
 # GOAT Trading Bot - Rule Engine
-# Built strictly according to documented Silver Bullet strategy
-# Version 2.0 — Confidence Scoring Added
+# v4.0 -- FTMO edition (1-Step, $10,000 account)
+#
+# Built and verified: real point values confirmed live on FTMO demo (all US indices +
+# forex/gold = $1.00/point, GER40 = ~$1.15, EUR-denominated so it drifts with EUR/USD --
+# re-verify periodically). Real FTMO drawdown mechanics: daily floor and max loss floor
+# both recalculate ONCE per day at 00:00 CET/CEST from the previous day's closing balance
+# (not continuous). Best Day Rule tracking (informational -- doesn't block trading, blocks
+# passing/reward). Per-pair trend/zone profiles from backtesting: trend-alignment helps
+# EURUSD/GBPUSD/XAUUSD/US500/DE40, hurts USTEC/US30. Risk per trade: 2% ($200) on primary/
+# well-validated pairs, 1% ($100) on thin-sample pairs (US30/US500/DE40).
+#
+# STILL OUTSTANDING:
+# - Spread/slippage not priced into backtested P&L -- GBPUSD's real R:R runs closer to 1:1.4
+# - GER40's point value drifts with EUR/USD -- 1.15 here is a conservative estimate
+# - Best Day tracking is a pure function -- daily_pnl_by_date must be persisted externally
+#   (live_trader.py's state file handles this)
 
 from datetime import datetime, time as dtime
 import pytz
@@ -9,851 +23,302 @@ import math
 from news import get_forex_news, get_trade_verdict
 
 WAT = pytz.timezone('Africa/Lagos')
+CET = pytz.timezone('Europe/Prague')
 
-# ── ACCOUNT CONFIGURATION ──
-ACCOUNTS = {
-    'Account 1': {
-        'pair': 'XAUUSD',
-        'balance': 1000,
-        'risk_per_trade': 10,
-        'daily_loss_limit': 30,
-        'total_drawdown_limit': 50,
-    },
-    'Account 2': {
-        'pair': 'EURUSD/GBPUSD',
-        'balance': 1000,
-        'risk_per_trade': 10,
-        'daily_loss_limit': 30,
-        'total_drawdown_limit': 50,
-    }
+# ── ACCOUNT ──
+INITIAL_CAPITAL = 10000
+DAILY_LOSS_PCT = 0.03
+MAX_LOSS_PCT = 0.10
+
+PAIR_RISK = {
+    'XAUUSD': 200, 'EURUSD': 200, 'GBPUSD': 200,
+    'USTEC': 200,
+    'US30': 100,
+    'US500': 100,
+    'DE40': 100,
 }
 
-# ── KILL SWITCH CONFIGURATION ──
-MAX_CONSECUTIVE_LOSSES = 3      # Pause after 3 consecutive losses
-KILL_SWITCH_HOURS = 24          # Hours to pause after kill switch triggers
-MAX_WEEKLY_LOSSES = 5           # Stop trading for the week after 5 losses
+POINT_VALUES = {
+    'EURUSD': 1.00, 'GBPUSD': 1.00, 'XAUUSD': 1.00,
+    'USTEC': 1.00, 'US30': 1.00, 'US500': 1.00,
+    'DE40': 1.15,
+}
+MIN_LOT = 0.01
+MAX_LOT = 1.00
 
-def check_kill_switch(consecutive_losses, last_loss_timestamp=None):
-    """
-    Checks if the kill switch has been triggered.
-    
-    Triggers if:
-    - 3 or more consecutive losses recorded
-    - Within the 24 hour cooldown period
-    
-    Args:
-        consecutive_losses: number of losses in a row
-        last_loss_timestamp: datetime of the last loss (WAT)
-    
-    Returns:
-        dict with kill switch status and reason
-    """
-    # Check consecutive losses
+def get_account_for_pair(pair):
+    return 'FTMO Account'
+
+# ── PER-PAIR STRATEGY PROFILES ──
+PAIR_PROFILES = {
+    'EURUSD': {'trend_required': True,  'zone_required': True},
+    'GBPUSD': {'trend_required': True,  'zone_required': True},
+    'XAUUSD': {'trend_required': True,  'zone_required': True},
+    'USTEC':  {'trend_required': False, 'zone_required': True},
+    'US30':   {'trend_required': False, 'zone_required': False},
+    'US500':  {'trend_required': True,  'zone_required': True},
+    'DE40':   {'trend_required': True,  'zone_required': False},
+}
+DEFAULT_PROFILE = {'trend_required': True, 'zone_required': True}
+
+def get_pair_profile(pair):
+    return PAIR_PROFILES.get(pair, DEFAULT_PROFILE)
+
+# ── KILL SWITCH ──
+MAX_CONSECUTIVE_LOSSES = 3
+KILL_SWITCH_HOURS = 24
+
+def check_kill_switch(consecutive_losses, last_loss_timestamp=None, now_override=None):
+    now_fn = (lambda: now_override) if now_override else (lambda: datetime.now(WAT))
     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-        # Check if 24 hours have passed since last loss
         if last_loss_timestamp:
-            now = datetime.now(WAT)
-            # Convert string timestamp to datetime if needed
-            if isinstance(last_loss_timestamp, str):
-                last_loss = datetime.strptime(
-                    last_loss_timestamp, '%Y-%m-%d %H:%M WAT'
-                ).replace(tzinfo=WAT)
-            else:
-                last_loss = last_loss_timestamp
-            
-            hours_since_loss = (now - last_loss).total_seconds() / 3600
-            
+            now = now_fn()
+            hours_since_loss = (now - last_loss_timestamp).total_seconds() / 3600
             if hours_since_loss < KILL_SWITCH_HOURS:
                 remaining = round(KILL_SWITCH_HOURS - hours_since_loss, 1)
-                return {
-                    'triggered': True,
-                    'reason': f"Kill switch active — {consecutive_losses} consecutive losses detected. {remaining} hours remaining before trading resumes.",
-                    'hours_remaining': remaining,
-                    'consecutive_losses': consecutive_losses
-                }
-            else:
-                # 24 hours passed — kill switch resets
-                return {
-                    'triggered': False,
-                    'reason': f"Kill switch cooldown complete — 24 hours passed since last loss. Trading permitted.",
-                    'consecutive_losses': consecutive_losses
-                }
-        else:
-            return {
-                'triggered': True,
-                'reason': f"Kill switch active — {consecutive_losses} consecutive losses. No timestamp available — pause trading manually for 24 hours.",
-                'consecutive_losses': consecutive_losses
-            }
-    
-    return {
-        'triggered': False,
-        'reason': f"Kill switch inactive — {consecutive_losses} consecutive losses (threshold: {MAX_CONSECUTIVE_LOSSES})",
-        'consecutive_losses': consecutive_losses
-    }
+                return {'triggered': True, 'reason': f"Kill switch active -- {remaining}h remaining.",
+                        'hours_remaining': remaining, 'consecutive_losses': consecutive_losses}
+            return {'triggered': False, 'reason': "Kill switch cooldown complete.",
+                    'consecutive_losses': consecutive_losses}
+        return {'triggered': True, 'reason': "Kill switch active, no timestamp -- pause manually.",
+                'consecutive_losses': consecutive_losses}
+    return {'triggered': False, 'reason': f"{consecutive_losses} consecutive losses (threshold {MAX_CONSECUTIVE_LOSSES}).",
+            'consecutive_losses': consecutive_losses}
 
-# ── CONFIDENCE SCORING WEIGHTS ──
-# Each rule is assigned a weight reflecting its importance
-# Total possible score = 100
-# Trade only if confidence >= 85
+# ── FTMO-SPECIFIC DRAWDOWN LOGIC ──
+def get_cet_day_boundary(dt_wat):
+    dt_cet = dt_wat.astimezone(CET)
+    return dt_cet.date()
 
-RULE_WEIGHTS = {
-    'account_status':       0,   # Hard stop
-    'news_check':           10,
-    'market_open':          0,   # Hard stop
-    'silver_bullet_window': 0,   # Hard stop
-    'zone':                 0,   # Hard stop — NEVER buy premium, NEVER sell discount
-    'weekly_bias':          25,  # Increased to maintain 100 total
-    'bias_4h':              20,
-    'smt':                  15,
-    'price_action_5m':      20,
-    'rr_ratio':             10,
-}
+def compute_daily_floors(daily_closing_balances, initial_capital):
+    if not daily_closing_balances:
+        yesterday_close = initial_capital
+        peak_close = initial_capital
+    else:
+        dates_sorted = sorted(daily_closing_balances.keys())
+        yesterday_close = daily_closing_balances[dates_sorted[-1]]
+        peak_close = max(list(daily_closing_balances.values()) + [initial_capital])
 
-# Minimum confidence required to take a trade
-MIN_CONFIDENCE = 85
+    daily_floor = yesterday_close - (DAILY_LOSS_PCT * initial_capital)
+    max_loss_floor = peak_close - (MAX_LOSS_PCT * initial_capital)
+    return daily_floor, max_loss_floor
 
-# News confidence penalty
-CATEGORY_2_PENALTY = 5  # Caution news reduces confidence by 5 points
+def check_account_status(current_equity, daily_floor, max_loss_floor):
+    if current_equity <= max_loss_floor:
+        return {'can_trade': False, 'reason': f"Max Loss breached: equity {current_equity:.2f} <= floor {max_loss_floor:.2f}"}
+    if current_equity <= daily_floor:
+        return {'can_trade': False, 'reason': f"Daily Loss breached: equity {current_equity:.2f} <= floor {daily_floor:.2f}"}
+    return {'can_trade': True, 'reason': 'Account within FTMO limits'}
 
-# ── LAYER 1: ACCOUNT RISK STATE ──
-def check_account_status(account_name, today_loss, total_drawdown):
-    """
-    Checks if an account is allowed to trade based on drawdown rules.
-    Returns a dict with status and reason.
-    """
-    account = ACCOUNTS[account_name]
-    if total_drawdown >= account['total_drawdown_limit']:
-        return {
-            'can_trade': False,
-            'reason': f"Account locked - total drawdown ${total_drawdown} has reached or exceeded ${account['total_drawdown_limit']} limit"
-        }
-    if today_loss >= account['daily_loss_limit']:
-        return {
-            'can_trade': False,
-            'reason': f"Daily loss limit hit - today's loss ${today_loss} has reached or exceeded ${account['daily_loss_limit']} limit"
-        }
-    return {
-        'can_trade': True,
-        'reason': 'Account within risk limits'
-    }
+def check_best_day_rule(daily_pnl_by_date):
+    positive_days = {d: p for d, p in daily_pnl_by_date.items() if p > 0}
+    if not positive_days:
+        return {'compliant': True, 'best_day_pct': 0, 'reason': 'No positive days yet'}
+    total_positive = sum(positive_days.values())
+    best_day = max(positive_days.values())
+    pct = (best_day / total_positive) * 100 if total_positive > 0 else 0
+    compliant = pct <= 50
+    return {'compliant': compliant, 'best_day_pct': round(pct, 1),
+            'reason': f"Best day is {pct:.1f}% of positive-day profit "
+                      f"({'OK' if compliant else 'need more profitable days before this counts toward passing'})"}
 
-# ── LAYER 2: NEWS / CALENDAR CHECK ──
-# TEMPORARY: Uses headline scanning from NewsAPI.
-# REPLACE WITH: news_engine/ module before live trading.
-
-CATEGORY_1_KEYWORDS = [
-    'nonfarm payroll', 'non-farm payroll', 'NFP',
-    'federal reserve rate', 'fed rate decision', 'FOMC rate',
-    'interest rate decision', 'fed funds rate',
-    'consumer price index', 'CPI report', 'core CPI',
-    'PCE price index', 'personal consumption expenditure',
-    'bank of england rate', 'BoE rate decision', 'MPC rate',
-    'ECB rate decision', 'european central bank rate',
-    'gross domestic product', 'GDP report'
-]
-
-CATEGORY_2_KEYWORDS = [
-    'jobless claims', 'unemployment claims',
-    'retail sales', 'manufacturing PMI', 'services PMI',
-    'trade balance', 'consumer confidence',
-    'industrial production', 'PCE inflation',
-    'crude oil inventories', 'UoM consumer sentiment',
-    'CB leading index', 'flash PMI',
-    'UK unemployment', 'claimant count',
-    'average earnings', 'UK wages'
-]
+# ── NEWS CHECK ──
+CATEGORY_1_KEYWORDS = ['nonfarm payroll', 'non-farm payroll', 'NFP', 'federal reserve rate', 'fed rate decision',
+                       'FOMC rate', 'interest rate decision', 'fed funds rate', 'consumer price index', 'CPI report',
+                       'core CPI', 'PCE price index', 'personal consumption expenditure', 'bank of england rate',
+                       'BoE rate decision', 'MPC rate', 'ECB rate decision', 'european central bank rate',
+                       'gross domestic product', 'GDP report']
+CATEGORY_2_KEYWORDS = ['jobless claims', 'unemployment claims', 'retail sales', 'manufacturing PMI', 'services PMI',
+                       'trade balance', 'consumer confidence', 'industrial production', 'PCE inflation',
+                       'crude oil inventories', 'UoM consumer sentiment', 'CB leading index', 'flash PMI',
+                       'UK unemployment', 'claimant count', 'average earnings', 'UK wages']
 
 def check_news_status():
-    """
-    Checks today's news for Category 1 and Category 2 events.
-    Returns a dict with trading permission and reason.
-    """
-    try:
-        articles = get_forex_news()
-        all_headlines = ' '.join([
-            article['title'].lower() for article in articles
-        ])
-        for keyword in CATEGORY_1_KEYWORDS:
-            if keyword.lower() in all_headlines:
-                return {
-                    'can_trade': False,
-                    'category': 1,
-                    'reason': f"Category 1 no-trade event detected: {keyword}",
-                    'caution': False
-                }
-        for keyword in CATEGORY_2_KEYWORDS:
-            if keyword.lower() in all_headlines:
-                return {
-                    'can_trade': True,
-                    'category': 2,
-                    'reason': f"Category 2 caution event detected: {keyword} — verify it does not fall inside your specific Silver Bullet window",
-                    'caution': True
-                }
-        return {
-            'can_trade': True,
-            'category': 3,
-            'reason': 'No high impact events detected — green light day',
-            'caution': False
-        }
-    except Exception as e:
-        return {
-            'can_trade': True,
-            'category': 2,
-            'reason': f"News check failed: {e} — proceed with caution and verify calendar manually",
-            'caution': True
-        }
+    # forward-looking calendar check (blocks BEFORE an event, not just after) --
+    # replaces the old reactive headline-scanning approach
+    from news import check_economic_calendar_blackout
+    import pytz
+    now_utc = datetime.now(WAT).astimezone(pytz.UTC)
+    calendar_check = check_economic_calendar_blackout(now_utc)
 
-# ── LAYER 3: SILVER BULLET TIME WINDOW CHECKER ──
+    if calendar_check['in_blackout']:
+        if calendar_check['severity'] == 'NO TRADE':
+            return {'can_trade': False, 'category': 1, 'reason': calendar_check['reason'], 'caution': False}
+        else:
+            return {'can_trade': True, 'category': 2, 'reason': calendar_check['reason'], 'caution': True}
 
+    return {'can_trade': True, 'category': 3, 'reason': 'No scheduled high/medium impact events nearby', 'caution': False}
+
+# ── SESSIONS ──
 SILVER_BULLET_WINDOWS = {
-    'London': {
-        'pair': 'EURUSD/GBPUSD',
-        'start': dtime(9, 0),
-        'end': dtime(10, 0),
-    },
-    'Gold NY': {
-        'pair': 'XAUUSD',
-        'start': dtime(13, 30),
-        'end': dtime(14, 30),
-    },
-    'Forex NY': {
-        'pair': 'EURUSD/GBPUSD',
-        'start': dtime(15, 0),
-        'end': dtime(16, 0),
-    }
+    'Asian KZ':       {'pair': 'EURUSD/GBPUSD/XAUUSD', 'start': dtime(0, 0),  'end': dtime(1, 0)},
+    'London Open KZ': {'pair': 'EURUSD/GBPUSD/XAUUSD/DE40', 'start': dtime(8, 0),  'end': dtime(9, 0)},
+    'London':         {'pair': 'EURUSD/GBPUSD', 'start': dtime(9, 0),  'end': dtime(10, 0)},
+    'Gold NY':        {'pair': 'XAUUSD', 'start': dtime(13, 30), 'end': dtime(14, 30)},
+    'Forex NY':       {'pair': 'EURUSD/GBPUSD', 'start': dtime(15, 0),  'end': dtime(16, 0)},
+    'NASDAQ PM':      {'pair': 'USTEC/US30/US500', 'start': dtime(15, 0), 'end': dtime(16, 0)},
 }
 
-def check_silver_bullet_window():
-    """
-    Checks if the current WAT time falls inside any Silver Bullet window.
-    Returns which session is active, or None if outside all windows.
-    """
-    now = datetime.now(WAT)
+def check_silver_bullet_window(now_override=None):
+    now = now_override if now_override else datetime.now(WAT)
     current_time = now.time()
     for session_name, window in SILVER_BULLET_WINDOWS.items():
         if window['start'] <= current_time < window['end']:
-            return {
-                'active': True,
-                'session': session_name,
-                'pair': window['pair'],
-                'window_start': window['start'].strftime('%H:%M'),
-                'window_end': window['end'].strftime('%H:%M'),
-                'current_time_wat': now.strftime('%H:%M WAT'),
-                'minutes_remaining': int(
-                    (datetime.combine(now.date(), window['end']) -
-                     now.replace(tzinfo=None)).seconds / 60
-                )
-            }
-    next_window = None
-    next_session = None
+            return {'active': True, 'session': session_name, 'pair': window['pair']}
+    next_window, next_session = None, None
     for session_name, window in SILVER_BULLET_WINDOWS.items():
         if window['start'] > current_time:
             if next_window is None or window['start'] < next_window:
-                next_window = window['start']
-                next_session = session_name
-    return {
-        'active': False,
-        'session': None,
-        'pair': None,
-        'current_time_wat': now.strftime('%H:%M WAT'),
-        'next_session': next_session,
-        'next_window_opens': next_window.strftime('%H:%M WAT') if next_window else 'No more windows today'
-    }
+                next_window, next_session = window['start'], session_name
+    return {'active': False, 'session': None, 'pair': None,
+            'next_session': next_session, 'next_window_opens': next_window.strftime('%H:%M WAT') if next_window else 'No more windows today'}
 
-def is_weekend():
-    """Checks if today is Saturday or Sunday."""
-    now = datetime.now(WAT)
+def is_weekend(now_override=None):
+    now = now_override if now_override else datetime.now(WAT)
     return now.weekday() in [5, 6]
 
-def is_friday_close():
-    """Checks if it is past 22:00 WAT on Friday."""
-    now = datetime.now(WAT)
-    if now.weekday() == 4 and now.hour >= 22:
-        return True
-    return False
+def is_friday_close(now_override=None):
+    now = now_override if now_override else datetime.now(WAT)
+    return now.weekday() == 4 and now.hour >= 22
 
-# ── LAYER 4: LOT SIZE CALCULATOR ──
-
-POINT_VALUES = {
-    'EURUSD': 1.0,
-    'GBPUSD': 1.0,
-    'XAUUSD': 1.0,
-}
-
-MIN_LOT = 0.01
-MAX_LOT = 0.10
-
-def calculate_lot_size(pair, sl_points, account_name):
-    """
-    Calculates the correct lot size based on fixed $10 risk
-    and actual structural SL distance in points.
-    Always rounds DOWN — never rounds up on risk.
-    """
+# ── POSITION SIZING ──
+def calculate_lot_size(pair, sl_points):
     if sl_points <= 0:
-        return {
-            'valid': False,
-            'reason': 'SL distance must be greater than zero'
-        }
-    if pair not in POINT_VALUES:
-        return {
-            'valid': False,
-            'reason': f'Unknown pair: {pair}. Must be EURUSD, GBPUSD, or XAUUSD'
-        }
-    account = ACCOUNTS[account_name]
-    risk_amount = account['risk_per_trade']
+        return {'valid': False, 'reason': 'SL distance must be greater than zero'}
+    if pair not in POINT_VALUES or pair not in PAIR_RISK:
+        return {'valid': False, 'reason': f'Unknown pair: {pair}'}
+    risk_amount = PAIR_RISK[pair]
     point_value = POINT_VALUES[pair]
     raw_lot = risk_amount / (sl_points * point_value)
     lot_size = math.floor(raw_lot * 100) / 100
     if lot_size < MIN_LOT:
-        return {
-            'valid': False,
-            'reason': f'Calculated lot size {lot_size} is below minimum {MIN_LOT}. SL distance of {sl_points} points is too wide for $10 risk. Consider skipping this trade.',
-            'calculated_lot': lot_size,
-            'sl_points': sl_points
-        }
+        return {'valid': False, 'reason': f'Lot size {lot_size} below minimum {MIN_LOT}. SL may be too wide for this risk amount.',
+                'sl_points': sl_points}
     if lot_size > MAX_LOT:
         lot_size = MAX_LOT
     actual_risk = lot_size * sl_points * point_value
-    min_tp_points = sl_points * 2
-    expected_reward = actual_risk * 2
-    return {
-        'valid': True,
-        'pair': pair,
-        'lot_size': lot_size,
-        'sl_points': sl_points,
-        'min_tp_points': min_tp_points,
-        'risk_amount': round(actual_risk, 2),
-        'expected_reward': round(expected_reward, 2),
-        'r_r_ratio': '1:2 minimum',
-        'reason': f'Lot size calculated: {lot_size} lots | Risk: ${round(actual_risk, 2)} | Min TP: {min_tp_points} points'
-    }
+    return {'valid': True, 'pair': pair, 'lot_size': lot_size, 'sl_points': sl_points,
+            'risk_amount': round(actual_risk, 2), 'expected_reward': round(actual_risk * 2, 2)}
 
 def verify_rr_ratio(sl_points, tp_points):
-    """Verifies that the trade meets the minimum 1:2 R:R requirement."""
     if sl_points <= 0 or tp_points <= 0:
-        return {
-            'valid': False,
-            'reason': 'SL and TP distances must both be greater than zero'
-        }
+        return {'valid': False, 'reason': 'SL and TP distances must both be greater than zero'}
     actual_ratio = tp_points / sl_points
     if actual_ratio < 2.0:
-        return {
-            'valid': False,
-            'actual_ratio': round(actual_ratio, 2),
-            'reason': f'R:R ratio is 1:{round(actual_ratio, 2)} — minimum required is 1:2. Adjust TP or skip trade.'
-        }
-    return {
-        'valid': True,
-        'actual_ratio': round(actual_ratio, 2),
-        'reason': f'R:R ratio verified: 1:{round(actual_ratio, 2)} — meets minimum 1:2 requirement'
-    }
+        return {'valid': False, 'actual_ratio': round(actual_ratio, 2), 'reason': f'R:R is 1:{round(actual_ratio,2)} -- minimum is 1:2'}
+    return {'valid': True, 'actual_ratio': round(actual_ratio, 2), 'reason': f'R:R verified: 1:{round(actual_ratio,2)}'}
 
-# ── CONFIDENCE SCORE CALCULATOR ──
+# ── CONFIDENCE SCORING ──
+RULE_WEIGHTS = {
+    'account_status': 0, 'news_check': 10, 'market_open': 0, 'silver_bullet_window': 0, 'zone': 0,
+    'weekly_bias': 25, 'bias_4h': 20, 'smt': 15, 'price_action_5m': 20, 'rr_ratio': 10,
+}
+MIN_CONFIDENCE = 85
+CATEGORY_2_PENALTY = 5
 
-def calculate_confidence(checklist_results, news_caution=False):
-    """
-    Calculates a confidence score from 0-100 based on weighted rule results.
-    Hard stops are not scored — they must pass regardless.
-    Trade only if confidence >= 85.
-    """
+def calculate_confidence(results, news_caution=False):
     total_score = 0
     max_possible = sum(w for rule, w in RULE_WEIGHTS.items() if w > 0)
     scored_rules = {}
-
     for rule, weight in RULE_WEIGHTS.items():
-        if weight == 0:
+        if weight == 0 or rule not in results:
             continue
-        if rule not in checklist_results:
-            continue
-        result = checklist_results[rule]
-        if 'passed' in result and result['passed']:
+        result = results[rule]
+        if result.get('passed'):
             total_score += weight
-            scored_rules[rule] = {
-                'weight': weight,
-                'earned': weight,
-                'passed': True
-            }
+            scored_rules[rule] = {'weight': weight, 'earned': weight, 'passed': True}
         else:
-            scored_rules[rule] = {
-                'weight': weight,
-                'earned': 0,
-                'passed': False
-            }
-
-    # Apply Category 2 news penalty
+            scored_rules[rule] = {'weight': weight, 'earned': 0, 'passed': False}
     if news_caution:
         total_score = max(0, total_score - CATEGORY_2_PENALTY)
-
     confidence = round((total_score / max_possible) * 100, 1)
+    if confidence >= 95: grade, recommendation = 'A+', 'EXCEPTIONAL SETUP -- HIGH CONVICTION TRADE'
+    elif confidence >= 90: grade, recommendation = 'A', 'STRONG SETUP -- TAKE THE TRADE'
+    elif confidence >= 85: grade, recommendation = 'B', 'GOOD SETUP -- TAKE THE TRADE'
+    elif confidence >= 75: grade, recommendation = 'C', 'MARGINAL SETUP -- STAND ASIDE'
+    else: grade, recommendation = 'D', 'WEAK SETUP -- DO NOT TRADE'
+    return {'score': confidence, 'grade': grade, 'recommendation': recommendation,
+            'meets_threshold': confidence >= MIN_CONFIDENCE, 'scored_rules': scored_rules,
+            'news_caution_applied': news_caution}
 
-    if confidence >= 95:
-        grade = 'A+'
-        recommendation = 'EXCEPTIONAL SETUP — HIGH CONVICTION TRADE'
-    elif confidence >= 90:
-        grade = 'A'
-        recommendation = 'STRONG SETUP — TAKE THE TRADE'
-    elif confidence >= 85:
-        grade = 'B'
-        recommendation = 'GOOD SETUP — TAKE THE TRADE'
-    elif confidence >= 75:
-        grade = 'C'
-        recommendation = 'MARGINAL SETUP — STAND ASIDE'
-    else:
-        grade = 'D'
-        recommendation = 'WEAK SETUP — DO NOT TRADE'
-
-    return {
-        'score': confidence,
-        'grade': grade,
-        'recommendation': recommendation,
-        'meets_threshold': confidence >= MIN_CONFIDENCE,
-        'scored_rules': scored_rules,
-        'news_caution_applied': news_caution
-    }
-
-# ── LAYER 5: TRADE CHECKLIST EVALUATOR ──
-
-def evaluate_checklist(
-    account_name,
-    today_loss,
-    total_drawdown,
-    pair,
-    direction,
-    weekly_bias,
-    bias_4h,
-    sma_50_slope,
-    zone,
-    smt_agreement,
-    smt_divergence,
-    fvg_or_ob,
-    liquidity_swept,
-    bos_confirmed,
-    sl_points,
-    tp_points,
-):
-    """
-    Evaluates all checklist conditions from the Silver Bullet strategy.
-    ALL hard stops must pass AND confidence must be >= 85.
-    """
+# ── MAIN FUNCTION ──
+def evaluate_checklist(current_equity, daily_floor, max_loss_floor, pair, direction,
+                        weekly_bias, bias_4h, sma_50_slope, zone, smt_agreement,
+                        smt_divergence, fvg_or_ob, liquidity_swept, bos_confirmed,
+                        sl_points, tp_points, now_override=None):
+    profile = get_pair_profile(pair)
     results = {}
 
-    # BOX 1: ACCOUNT RISK STATUS
-    account_status = check_account_status(account_name, today_loss, total_drawdown)
-    results['account_status'] = {
-        'passed': account_status['can_trade'],
-        'reason': account_status['reason']
-    }
+    acc_status = check_account_status(current_equity, daily_floor, max_loss_floor)
+    results['account_status'] = {'passed': acc_status['can_trade'], 'reason': acc_status['reason']}
 
-    # BOX 2: NEWS CHECK
     news_status = check_news_status()
-    results['news_check'] = {
-        'passed': news_status['can_trade'],
-        'reason': news_status['reason'],
-        'caution': news_status.get('caution', False)
-    }
+    results['news_check'] = {'passed': news_status['can_trade'], 'reason': news_status['reason'],
+                              'caution': news_status.get('caution', False)}
 
-    # BOX 3: WEEKEND / FRIDAY CLOSE CHECK
-    weekend = is_weekend()
-    friday_close = is_friday_close()
-    results['market_open'] = {
-        'passed': not weekend and not friday_close,
-        'reason': 'Weekend — no trading' if weekend else
-                  'Friday after 22:00 WAT — markets closing' if friday_close else
-                  'Market open — weekday within trading hours'
-    }
+    weekend = is_weekend(now_override)
+    friday_close = is_friday_close(now_override)
+    results['market_open'] = {'passed': not weekend and not friday_close,
+                               'reason': 'Weekend' if weekend else 'Friday after 22:00 WAT' if friday_close else 'Market open'}
 
-    # BOX 4: SILVER BULLET WINDOW
-    window = check_silver_bullet_window()
-    results['silver_bullet_window'] = {
-        'passed': window['active'],
-        'reason': f"Active session: {window['session']} — {window.get('minutes_remaining', 0)} minutes remaining" if window['active'] else
-                  f"Outside Silver Bullet window — next session: {window.get('next_session', 'None')} at {window.get('next_window_opens', 'N/A')}"
-    }
+    window = check_silver_bullet_window(now_override)
+    results['silver_bullet_window'] = {'passed': window['active'],
+                                        'reason': f"Active session: {window['session']}" if window['active'] else 'Outside window'}
 
-    # BOX 5: WEEKLY BIAS
-    weekly_bias_valid = weekly_bias in ['bullish', 'bearish']
-    weekly_direction_match = (
-        (weekly_bias == 'bullish' and direction == 'buy') or
-        (weekly_bias == 'bearish' and direction == 'sell')
-    )
-    results['weekly_bias'] = {
-        'passed': weekly_bias_valid and weekly_direction_match,
-        'reason': f'Weekly bias is {weekly_bias} — trade direction {direction} {"matches" if weekly_direction_match else "conflicts with"} weekly bias' if weekly_bias_valid else
-                  'Weekly bias is ranging — no trade this week'
-    }
+    if profile['trend_required']:
+        weekly_bias_valid = weekly_bias in ['bullish', 'bearish']
+        weekly_direction_match = ((weekly_bias == 'bullish' and direction == 'buy') or (weekly_bias == 'bearish' and direction == 'sell'))
+        results['weekly_bias'] = {'passed': weekly_bias_valid and weekly_direction_match, 'reason': f'Weekly bias {weekly_bias}'}
+        bias_4h_matches_weekly = bias_4h == weekly_bias
+        sma_matches_direction = ((direction == 'buy' and sma_50_slope == 'up') or (direction == 'sell' and sma_50_slope == 'down'))
+        results['bias_4h'] = {'passed': bias_4h_matches_weekly and sma_matches_direction, 'reason': f'4H bias {bias_4h}'}
+    else:
+        results['weekly_bias'] = {'passed': True, 'reason': f'Weekly bias {weekly_bias} (not required for {pair})'}
+        results['bias_4h'] = {'passed': True, 'reason': f'4H bias {bias_4h} (not required for {pair})'}
 
-    # BOX 6: 4H BIAS
-    bias_4h_matches_weekly = bias_4h == weekly_bias
-    sma_matches_direction = (
-        (direction == 'buy' and sma_50_slope == 'up') or
-        (direction == 'sell' and sma_50_slope == 'down')
-    )
-    results['bias_4h'] = {
-        'passed': bias_4h_matches_weekly and sma_matches_direction,
-        'reason': f'4H bias {bias_4h} {"matches" if bias_4h_matches_weekly else "conflicts with"} weekly bias | SMA 50 slope {sma_50_slope} {"confirms" if sma_matches_direction else "conflicts with"} {direction} direction'
-    }
+    zone_valid = ((direction == 'buy' and zone == 'discount') or (direction == 'sell' and zone == 'premium'))
+    results['zone'] = {'passed': zone_valid, 'reason': f'Zone {zone} for {direction}', 'enforced': profile['zone_required']}
 
-    # BOX 7: PREMIUM / DISCOUNT ZONE
-    zone_valid = (
-        (direction == 'buy' and zone == 'discount') or
-        (direction == 'sell' and zone == 'premium')
-    )
-    results['zone'] = {
-        'passed': zone_valid,
-        'reason': f'Price in {zone} zone — {"valid" if zone_valid else "invalid"} for {direction} trade. Never buy in premium. Never sell in discount.'
-    }
-
-    # BOX 8: SMT DIVERGENCE
     smt_valid = smt_agreement or smt_divergence
-    results['smt'] = {
-        'passed': smt_valid,
-        'reason': 'SMT confirmed — both pairs agree' if smt_agreement else
-                  'SMT divergence signal detected — valid entry signal' if smt_divergence else
-                  'SMT invalid — pairs contradict with no clear divergence pattern'
-    }
+    results['smt'] = {'passed': smt_valid, 'reason': 'SMT valid' if smt_valid else 'SMT invalid'}
 
-    # BOX 9: 5M PRICE ACTION
     price_action_valid = liquidity_swept and bos_confirmed and fvg_or_ob
-    results['price_action_5m'] = {
-        'passed': price_action_valid,
-        'reason': (
-            f'Liquidity sweep: {"✅" if liquidity_swept else "❌"} | '
-            f'BOS confirmed: {"✅" if bos_confirmed else "❌"} | '
-            f'FVG/OB present: {"✅" if fvg_or_ob else "❌"}'
-        )
-    }
+    results['price_action_5m'] = {'passed': price_action_valid, 'reason': f'sweep={liquidity_swept} bos={bos_confirmed} fvg={fvg_or_ob}'}
 
-    # BOX 10: R:R VERIFICATION
     rr = verify_rr_ratio(sl_points, tp_points)
-    results['rr_ratio'] = {
-        'passed': rr['valid'],
-        'reason': rr['reason']
-    }
+    results['rr_ratio'] = {'passed': rr['valid'], 'reason': rr['reason']}
 
-    # LOT SIZE CALCULATION
-    lot_calc = calculate_lot_size(pair, sl_points, account_name)
-    results['lot_size'] = {
-        'valid': lot_calc['valid'],
-        'details': lot_calc
-    }
+    lot_calc = calculate_lot_size(pair, sl_points)
+    results['lot_size'] = {'valid': lot_calc['valid'], 'details': lot_calc}
 
-    # CONFIDENCE SCORE
-    news_caution = results.get('news_check', {}).get('caution', False)
+    news_caution = results['news_check']['caution']
     confidence = calculate_confidence(results, news_caution)
 
-    # FINAL VERDICT
-    hard_stops_passed = all([
-    results.get('account_status', {}).get('passed', False),
-    results.get('market_open', {}).get('passed', False),
-    results.get('silver_bullet_window', {}).get('passed', False),
-    results.get('news_check', {}).get('passed', False),
-    results.get('zone', {}).get('passed', False),  # Added
- ])
+    hard_stops_list = [
+        results['account_status']['passed'],
+        results['market_open']['passed'],
+        results['silver_bullet_window']['passed'],
+        results['news_check']['passed'],
+    ]
+    if profile['zone_required']:
+        hard_stops_list.append(results['zone']['passed'])
+    hard_stops_passed = all(hard_stops_list)
 
-    all_passed = hard_stops_passed and confidence['meets_threshold']
+    lot_valid = lot_calc['valid']
+    all_passed = hard_stops_passed and confidence['meets_threshold'] and lot_valid
 
-    passed_count = sum(
-        1 for v in results.values()
-        if 'passed' in v and v['passed']
-    )
-    total_count = sum(
-        1 for v in results.values()
-        if 'passed' in v
-    )
-
-    signal = 'VALID SETUP — LOOK FOR ENTRY' if all_passed else 'INVALID SETUP — STAND ASIDE'
+    passed_count = sum(1 for v in results.values() if 'passed' in v and v['passed'])
+    total_count = sum(1 for v in results.values() if 'passed' in v)
+    signal = 'VALID SETUP -- LOOK FOR ENTRY' if all_passed else 'INVALID SETUP -- STAND ASIDE'
 
     return {
-        'signal': signal,
-        'valid': all_passed,
-        'passed': passed_count,
-        'total': total_count,
-        'confidence': confidence['score'],
-        'grade': confidence['grade'],
-        'recommendation': confidence['recommendation'],
-        'pair': pair,
-        'direction': direction,
-        'account': account_name,
-        'lot_size': lot_calc.get('lot_size') if lot_calc['valid'] else None,
-        'sl_points': sl_points,
-        'tp_points': tp_points,
-        'risk_amount': lot_calc.get('risk_amount') if lot_calc['valid'] else None,
-        'expected_reward': lot_calc.get('expected_reward') if lot_calc['valid'] else None,
-        'checklist': results,
-        'confidence_breakdown': confidence['scored_rules'],
-        'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
+        'signal': signal, 'valid': all_passed, 'passed': passed_count, 'total': total_count,
+        'confidence': confidence['score'], 'grade': confidence['grade'], 'recommendation': confidence['recommendation'],
+        'pair': pair, 'direction': direction,
+        'lot_size': lot_calc.get('lot_size') if lot_valid else None,
+        'sl_points': sl_points, 'tp_points': tp_points,
+        'risk_amount': lot_calc.get('risk_amount') if lot_valid else None,
+        'expected_reward': lot_calc.get('expected_reward') if lot_valid else None,
+        'checklist': results, 'confidence_breakdown': confidence['scored_rules'],
+        'pair_profile_used': profile,
     }
-
-# ── LAYER 6: MAIN BOT FUNCTION ──
-
-def run_bot(
-    account_name,
-    today_loss,
-    total_drawdown,
-    pair,
-    direction,
-    weekly_bias,
-    bias_4h,
-    sma_50_slope,
-    zone,
-    smt_agreement,
-    smt_divergence,
-    fvg_or_ob,
-    liquidity_swept,
-    bos_confirmed,
-    sl_points,
-    tp_points,
-    consecutive_losses=0,
-    last_loss_timestamp=None
-):
-    """
-    Main entry point for the GOAT trading bot rule engine.
-    Runs the complete decision tree from the Silver Bullet strategy.
-    Does NOT execute trades yet — that is Session 11.
-    """
-    print("\n" + "="*60)
-    print("GOAT TRADING BOT — RULE ENGINE v2.0")
-    print("="*60)
-    print(f"Time: {datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')}")
-    print(f"Account: {account_name} | Pair: {pair} | Direction: {direction.upper()}")
-    print("="*60)
-
-    # ── KILL SWITCH CHECK ──
-    # Must be first check — overrides everything including account status
-    kill_switch = check_kill_switch(
-        consecutive_losses=consecutive_losses,
-        last_loss_timestamp=last_loss_timestamp
-    )
-    if kill_switch['triggered']:
-        report = {
-            'signal': 'NO TRADE — KILL SWITCH ACTIVE',
-            'valid': False,
-            'reason': kill_switch['reason'],
-            'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
-        }
-        print(f"\n🔴 {report['signal']}")
-        print(f"Reason: {report['reason']}")
-        return report
-
-    if is_weekend():
-        report = {
-            'signal': 'NO TRADE — WEEKEND',
-            'valid': False,
-            'reason': 'Markets closed. No trading Saturday or Sunday.',
-            'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
-        }
-        print(f"\n🔴 {report['signal']}")
-        print(f"Reason: {report['reason']}")
-        return report
-
-    if is_friday_close():
-        report = {
-            'signal': 'NO TRADE — FRIDAY CLOSE',
-            'valid': False,
-            'reason': 'Past 22:00 WAT Friday. Close all positions. Markets closing.',
-            'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
-        }
-        print(f"\n🔴 {report['signal']}")
-        print(f"Reason: {report['reason']}")
-        return report
-
-    account_status = check_account_status(account_name, today_loss, total_drawdown)
-    if not account_status['can_trade']:
-        report = {
-            'signal': 'NO TRADE — ACCOUNT LOCKED',
-            'valid': False,
-            'reason': account_status['reason'],
-            'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
-        }
-        print(f"\n🔴 {report['signal']}")
-        print(f"Reason: {report['reason']}")
-        return report
-
-    news_status = check_news_status()
-    if not news_status['can_trade']:
-        report = {
-            'signal': 'NO TRADE — HIGH IMPACT NEWS',
-            'valid': False,
-            'reason': news_status['reason'],
-            'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
-        }
-        print(f"\n🔴 {report['signal']}")
-        print(f"Reason: {report['reason']}")
-        return report
-
-    if news_status.get('caution'):
-        print(f"\n🟡 CAUTION: {news_status['reason']}")
-
-    window = check_silver_bullet_window()
-    if not window['active']:
-        report = {
-            'signal': 'NO TRADE — OUTSIDE SILVER BULLET WINDOW',
-            'valid': False,
-            'reason': f"Current time {window['current_time_wat']} is outside all Silver Bullet windows. Next: {window.get('next_session', 'None')} at {window.get('next_window_opens', 'N/A')}",
-            'timestamp': datetime.now(WAT).strftime('%Y-%m-%d %H:%M WAT')
-        }
-        print(f"\n🔴 {report['signal']}")
-        print(f"Reason: {report['reason']}")
-        return report
-
-    print(f"\n✅ Inside {window['session']} Silver Bullet window — {window.get('minutes_remaining', 0)} minutes remaining")
-
-    result = evaluate_checklist(
-        account_name=account_name,
-        today_loss=today_loss,
-        total_drawdown=total_drawdown,
-        pair=pair,
-        direction=direction,
-        weekly_bias=weekly_bias,
-        bias_4h=bias_4h,
-        sma_50_slope=sma_50_slope,
-        zone=zone,
-        smt_agreement=smt_agreement,
-        smt_divergence=smt_divergence,
-        fvg_or_ob=fvg_or_ob,
-        liquidity_swept=liquidity_swept,
-        bos_confirmed=bos_confirmed,
-        sl_points=sl_points,
-        tp_points=tp_points
-    )
-
-    print("\n── CHECKLIST RESULTS ──")
-    for check_name, check_result in result['checklist'].items():
-        if 'passed' in check_result:
-            status = "✅" if check_result['passed'] else "❌"
-            print(f"{status} {check_name.upper().replace('_', ' ')}: {check_result['reason']}")
-
-    print(f"\n── CONFIDENCE: {result['confidence']}/100 — Grade {result['grade']} ──")
-    print(f"── {result['recommendation']} ──")
-    print(f"\n── RESULT: {result['passed']}/{result['total']} checks passed ──")
-
-    if result['valid']:
-        print(f"\n🟢 {result['signal']}")
-        print(f"Pair: {result['pair']} | Direction: {result['direction'].upper()}")
-        print(f"Lot Size: {result['lot_size']} lots")
-        print(f"SL: {result['sl_points']} points | TP: {result['tp_points']} points")
-        print(f"Risk: ${result['risk_amount']} | Expected Reward: ${result['expected_reward']}")
-    else:
-        print(f"\n🔴 {result['signal']}")
-        print("Failed checks:")
-        for check_name, check_result in result['checklist'].items():
-            if 'passed' in check_result and not check_result['passed']:
-                print(f"  ❌ {check_name.upper().replace('_', ' ')}: {check_result['reason']}")
-
-    print("\n" + "="*60)
-    return result
-
-
-# ── TESTS ──
-if __name__ == '__main__':
-
-    print("\n=== TEST 1: VALID SETUP (all conditions met) ===")
-    result = evaluate_checklist(
-        account_name='Account 2',
-        today_loss=0,
-        total_drawdown=0,
-        pair='EURUSD',
-        direction='sell',
-        weekly_bias='bearish',
-        bias_4h='bearish',
-        sma_50_slope='down',
-        zone='premium',
-        smt_agreement=True,
-        smt_divergence=False,
-        fvg_or_ob=True,
-        liquidity_swept=True,
-        bos_confirmed=True,
-        sl_points=300,
-        tp_points=600
-    )
-    print(f"\nSIGNAL: {result['signal']}")
-    print(f"Confidence: {result['confidence']}/100 — Grade {result['grade']}")
-    print(f"Recommendation: {result['recommendation']}")
-    print(f"Checks passed: {result['passed']}/{result['total']}")
-    if result['valid']:
-        print(f"Lot size: {result['lot_size']} lots")
-        print(f"Risk: ${result['risk_amount']} | Reward: ${result['expected_reward']}")
-    print("\nFailed checks:")
-    for check_name, check_result in result['checklist'].items():
-        if 'passed' in check_result and not check_result['passed']:
-            print(f"  ❌ {check_name}: {check_result['reason']}")
-
-    print("\n=== TEST 2: INVALID SETUP — WRONG ZONE ===")
-    result2 = evaluate_checklist(
-        account_name='Account 2',
-        today_loss=0,
-        total_drawdown=0,
-        pair='EURUSD',
-        direction='sell',
-        weekly_bias='bearish',
-        bias_4h='bearish',
-        sma_50_slope='down',
-        zone='discount',
-        smt_agreement=True,
-        smt_divergence=False,
-        fvg_or_ob=True,
-        liquidity_swept=True,
-        bos_confirmed=True,
-        sl_points=300,
-        tp_points=600
-    )
-    print(f"\nSIGNAL: {result2['signal']}")
-    print(f"Confidence: {result2['confidence']}/100 — Grade {result2['grade']}")
-    print(f"Recommendation: {result2['recommendation']}")
-    print(f"Checks passed: {result2['passed']}/{result2['total']}")
-    print("\nFailed checks:")
-    for check_name, check_result in result2['checklist'].items():
-        if 'passed' in check_result and not check_result['passed']:
-            print(f"  ❌ {check_name}: {check_result['reason']}")
-
-    print("\n=== TEST 3: ACCOUNT LOCKED ===")
-    result3 = evaluate_checklist(
-        account_name='Account 2',
-        today_loss=0,
-        total_drawdown=50,
-        pair='EURUSD',
-        direction='sell',
-        weekly_bias='bearish',
-        bias_4h='bearish',
-        sma_50_slope='down',
-        zone='premium',
-        smt_agreement=True,
-        smt_divergence=False,
-        fvg_or_ob=True,
-        liquidity_swept=True,
-        bos_confirmed=True,
-        sl_points=300,
-        tp_points=600
-    )
-    print(f"\nSIGNAL: {result3['signal']}")
-    print(f"Confidence: {result3['confidence']}/100 — Grade {result3['grade']}")
-    print(f"Recommendation: {result3['recommendation']}")
-    print(f"Checks passed: {result3['passed']}/{result3['total']}")
-    print("\nFailed checks:")
-    for check_name, check_result in result3['checklist'].items():
-        if 'passed' in check_result and not check_result['passed']:
-            print(f"  ❌ {check_name}: {check_result['reason']}")
-
-    print("\n=== TEST 4: KILL SWITCH TRIGGERED ===")
-    kill_result = run_bot(
-        account_name='Account 2',
-        today_loss=0,
-        total_drawdown=0,
-        pair='EURUSD',
-        direction='sell',
-        weekly_bias='bearish',
-        bias_4h='bearish',
-        sma_50_slope='down',
-        zone='premium',
-        smt_agreement=True,
-        smt_divergence=False,
-        fvg_or_ob=True,
-        liquidity_swept=True,
-        bos_confirmed=True,
-        sl_points=300,
-        tp_points=600,
-        consecutive_losses=3,
-        last_loss_timestamp='2026-07-03 10:00 WAT'
-    )
-    print(f"\nSIGNAL: {kill_result['signal']}")
-    print(f"Reason: {kill_result['reason']}")
