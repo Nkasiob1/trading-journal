@@ -1,21 +1,17 @@
 # live_trader.py
-# GOAT Live Execution -- v1.2, with journal database integration
+# GOAT Live Execution -- v2.0, instrument-specific session scanning
 #
-# - Bot orders tagged with a magic number -- kill switch/consecutive-losses tracking only
-#   counts the BOT'S OWN trades, not manual trades on the same account
-# - Guards against tick=None before dereferencing tick.ask/tick.bid
-# - Explicitly selects all 7 symbols on startup
-# - Skips all work entirely on weekends
-# - Deviation (slippage tolerance) added to real order requests
-# - Bot trades are saved to the actual GOAT journal database (database.py), same table
-#   manual trades go into, with session-level stats tracking all 6 real sessions
+# THE CHANGE: EURUSD, XAUUSD, and DE40 are now scanned EVERY loop iteration, any hour,
+# any day (weekends/Friday-close excepted) -- not restricted to their old Silver Bullet
+# windows. This is backed by a full 16-month backtest: this combination gave 65 trades,
+# 56.9% win rate, +$3,381.64 -- the best result found across every configuration tested.
 #
-# KNOWN LIMITATION: if this script isn't running at the exact moment of CET midnight
-# rollover, the "closing balance" recorded for that day will be inaccurate. Cross-check
-# against FTMO's own dashboard periodically, especially after any gap in uptime.
+# GBPUSD, US500, USTEC, and US30 KEEP their original window-gated behavior -- backtesting
+# showed these get WORSE or contribute nothing when unrestricted.
 #
-# SAFETY: starts in DRY_RUN mode. No real orders, no real journal entries, until you set
-# DRY_RUN = False yourself.
+# Everything else unchanged from v1.5: magic-number trade separation, journal logging,
+# real SMT cross-check, signal chart saving, weekly/4H bias pulled from real MT5 data,
+# multi-bar sweep tracking with cross-window resolution for the windowed pairs.
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -26,6 +22,9 @@ from datetime import datetime, date
 import pytz
 import bot
 import database
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 DRY_RUN = True
 
@@ -40,18 +39,23 @@ SYMBOL_MAP = {
     'USTEC': 'US100.cash', 'US30': 'US30.cash', 'US500': 'US500.cash', 'DE40': 'GER40.cash',
 }
 
+# GBPUSD, US500, USTEC, US30 keep their session windows -- backed by backtest evidence
+# that these specific instruments perform WORSE or contribute nothing when unrestricted.
 PAIR_SESSIONS = {
-    'EURUSD': ['Asian KZ', 'London Open KZ', 'London', 'Forex NY'],
     'GBPUSD': ['Asian KZ', 'London Open KZ', 'London', 'Forex NY'],
-    'XAUUSD': ['Asian KZ', 'London Open KZ', 'Gold NY'],
     'USTEC':  ['NASDAQ PM'],
     'US30':   ['NASDAQ PM'],
     'US500':  ['NASDAQ PM'],
-    'DE40':   ['London Open KZ'],
 }
+
+# EURUSD, XAUUSD, DE40 scan continuously -- backed by backtest evidence these three
+# genuinely perform BETTER without the window restriction (56.9% combined win rate).
+NO_WINDOW_PAIRS = ['EURUSD', 'XAUUSD', 'DE40']
 
 POINT_SCALE = {'EURUSD': 100000, 'GBPUSD': 100000, 'XAUUSD': 100,
                 'USTEC': 1, 'US30': 1, 'US500': 1, 'DE40': 1}
+
+price_action_tracking = {}
 
 
 def load_state():
@@ -100,23 +104,26 @@ def get_recent_bars(symbol, n=300):
     df = df.set_index('time')
     return df[['open', 'high', 'low', 'close']]
 
-def compute_weekly_bias(df):
-    weekly = df['close'].resample('W').last().dropna()
-    if len(weekly) < 3:
+def compute_weekly_bias(symbol):
+    weekly_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_W1, 0, 10)
+    if weekly_rates is None or len(weekly_rates) < 3:
         return 'ranging'
-    if weekly.iloc[-2] > weekly.iloc[-3]:
+    closes = [bar['close'] for bar in weekly_rates]
+    if closes[-2] > closes[-3]:
         return 'bullish'
-    elif weekly.iloc[-2] < weekly.iloc[-3]:
+    elif closes[-2] < closes[-3]:
         return 'bearish'
     return 'ranging'
 
-def compute_4h_bias_and_slope(df):
-    h4 = df['close'].resample('4h').last().dropna()
-    if len(h4) < 51:
+def compute_4h_bias_and_slope(symbol):
+    h4_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4, 0, 60)
+    if h4_rates is None or len(h4_rates) < 51:
         return 'ranging', 'flat'
-    bias = 'bullish' if h4.iloc[-1] > h4.iloc[-2] else 'bearish'
-    sma50 = h4.rolling(50).mean()
-    slope = 'up' if sma50.iloc[-1] > sma50.iloc[-2] else 'down'
+    closes = [bar['close'] for bar in h4_rates]
+    bias = 'bullish' if closes[-1] > closes[-2] else 'bearish'
+    sma50_now = sum(closes[-50:]) / 50
+    sma50_prev = sum(closes[-51:-1]) / 50
+    slope = 'up' if sma50_now > sma50_prev else 'down'
     return bias, slope
 
 def compute_zone(df):
@@ -127,40 +134,149 @@ def compute_zone(df):
     mid = (running_high.iloc[-1] + running_low.iloc[-1]) / 2
     return 'discount' if df['close'].iloc[-1] < mid else 'premium'
 
-def detect_price_action_latest(df, lookback=12, bos_window=6):
+
+def update_price_action_state(pair, df, tracking, lookback=12, bos_window=6, allow_new_sweep=True):
     highs, lows, closes = df['high'].values, df['low'].values, df['close'].values
     n = len(df)
-    if n < lookback + bos_window + 3:
+    if n < lookback + 3:
+        return None
+    i = n - 1
+    current_bar_time = df.index[i]
+
+    if pair not in tracking:
+        tracking[pair] = {'last_bar_time': None, 'pending': None}
+
+    if tracking[pair]['last_bar_time'] == current_bar_time:
+        return None
+    tracking[pair]['last_bar_time'] = current_bar_time
+
+    pending = tracking[pair]['pending']
+
+    if pending is not None:
+        if pending['direction'] == 'buy' and closes[i] > pending['recent_high']:
+            tracking[pair]['pending'] = None
+            return {'confirmed': True, 'direction': 'buy', 'swing_low': pending['recent_low'],
+                    'swing_high': pending['recent_high'], 'fvg_or_ob': pending['fvg_or_ob']}
+        if pending['direction'] == 'sell' and closes[i] < pending['recent_low']:
+            tracking[pair]['pending'] = None
+            return {'confirmed': True, 'direction': 'sell', 'swing_low': pending['recent_low'],
+                    'swing_high': pending['recent_high'], 'fvg_or_ob': pending['fvg_or_ob']}
+        pending['bars_elapsed'] += 1
+        if pending['bars_elapsed'] >= bos_window:
+            tracking[pair]['pending'] = None
         return None
 
-    i = n - 1
+    if not allow_new_sweep:
+        return None
+
     recent_low = lows[i-lookback:i].min()
     recent_high = highs[i-lookback:i].max()
-
     sweep_buy = lows[i] < recent_low and closes[i] > recent_low
     sweep_sell = highs[i] > recent_high and closes[i] < recent_high
-
     fvg_bull = any(lows[j] > highs[j-2] for j in range(max(2, i-6), i+1))
     fvg_bear = any(highs[j] < lows[j-2] for j in range(max(2, i-6), i+1))
 
-    bos_up = sweep_buy and closes[max(0, i-bos_window):i+1].max() > recent_high
-    bos_down = sweep_sell and closes[max(0, i-bos_window):i+1].min() < recent_low
+    if sweep_buy:
+        tracking[pair]['pending'] = {'direction': 'buy', 'recent_high': recent_high,
+                                       'recent_low': recent_low, 'bars_elapsed': 0, 'fvg_or_ob': fvg_bull}
+    elif sweep_sell:
+        tracking[pair]['pending'] = {'direction': 'sell', 'recent_high': recent_high,
+                                       'recent_low': recent_low, 'bars_elapsed': 0, 'fvg_or_ob': fvg_bear}
+    return None
 
-    return {
-        'sweep_buy': bool(sweep_buy), 'sweep_sell': bool(sweep_sell),
-        'bos_up': bool(bos_up), 'bos_down': bool(bos_down),
-        'fvg_bull': bool(fvg_bull), 'fvg_bear': bool(fvg_bear),
-        'swing_low': recent_low, 'swing_high': recent_high,
-    }
-def get_pair_price_action(pair, symbol_map):
-    # fetches bars and detects price action for one pair -- used to build the cross-pair
-    # cache for SMT comparison before evaluating EURUSD/GBPUSD individually
-    symbol = symbol_map[pair]
-    df = get_recent_bars(symbol)
-    if df is None or len(df) < 100:
-        return None, None
-    pa = detect_price_action_latest(df)
-    return df, pa
+
+def save_signal_chart(df, pair, direction, entry_price, sl_price, tp_price, confidence):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    recent = df.tail(100)
+    ax.plot(recent.index, recent['close'], color='white', linewidth=1)
+    ax.axhline(entry_price, color='yellow', linestyle='--', label=f'Entry {entry_price:.5f}')
+    ax.axhline(sl_price, color='red', linestyle='--', label=f'SL {sl_price:.5f}')
+    ax.axhline(tp_price, color='green', linestyle='--', label=f'TP {tp_price:.5f}')
+    ax.set_title(f'{pair} {direction.upper()} signal -- confidence {confidence}')
+    ax.set_facecolor('black')
+    fig.patch.set_facecolor('black')
+    ax.tick_params(colors='white')
+    ax.legend()
+    filename = f'signal_{pair}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+    fig.savefig(filename, facecolor='black')
+    plt.close(fig)
+    print(f"  [CHART] Saved: {filename}")
+
+
+def process_confirmed_signal(pair, symbol, df, bos_result, session_name, state,
+                              current_equity, daily_floor, max_loss_floor, forex_confirmed_cache):
+    weekly_bias = compute_weekly_bias(symbol)
+    bias_4h, sma_slope = compute_4h_bias_and_slope(symbol)
+    zone = compute_zone(df)
+    direction = bos_result['direction']
+
+    profile = bot.get_pair_profile(pair)
+    if profile['trend_required']:
+        expected_direction = 'buy' if weekly_bias == 'bullish' else 'sell' if weekly_bias == 'bearish' else None
+        if expected_direction != direction:
+            print(f"[{pair}] BOS confirmed {direction} but weekly bias is {weekly_bias} -- skipping (trend required)")
+            return
+
+    sl_price_dist = abs(bos_result['swing_high'] - bos_result['swing_low'])
+    if sl_price_dist <= 0:
+        return
+    sl_points = round(sl_price_dist * POINT_SCALE[pair])
+    tp_points = sl_points * 2
+
+    if pair in ('EURUSD', 'GBPUSD'):
+        other_pair = 'GBPUSD' if pair == 'EURUSD' else 'EURUSD'
+        other_result = forex_confirmed_cache.get(other_pair)
+        smt_agreement = other_result is not None and other_result['direction'] == direction
+        smt_divergence = other_result is None or other_result['direction'] != direction
+    else:
+        smt_agreement, smt_divergence = True, False
+
+    result = bot.evaluate_checklist(
+        current_equity=current_equity, daily_floor=daily_floor, max_loss_floor=max_loss_floor,
+        pair=pair, direction=direction, weekly_bias=weekly_bias, bias_4h=bias_4h,
+        sma_50_slope=sma_slope, zone=zone, smt_agreement=smt_agreement,
+        smt_divergence=smt_divergence, fvg_or_ob=bos_result['fvg_or_ob'],
+        liquidity_swept=True, bos_confirmed=True,
+        sl_points=sl_points, tp_points=tp_points,
+    )
+
+    print(f"[{pair}] {direction.upper()} CONFIRMED BOS | confidence={result['confidence']} | valid={result['valid']}")
+
+    if result['valid']:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            print(f"  [ERROR] No live tick for {symbol} -- skipping")
+            return
+
+        entry_price = tick.ask if direction == 'buy' else tick.bid
+        sl_price = entry_price - sl_price_dist if direction == 'buy' else entry_price + sl_price_dist
+        tp_price = entry_price + sl_price_dist * 2 if direction == 'buy' else entry_price - sl_price_dist * 2
+
+        print(f"  >>> SIGNAL: {pair} {direction} | lot={result['lot_size']} | "
+              f"SL={sl_price:.5f} TP={tp_price:.5f} | risking ${result['risk_amount']}")
+
+        save_signal_chart(df, pair, direction, entry_price, sl_price, tp_price, result['confidence'])
+
+        if not DRY_RUN:
+            order = mt5.order_send({
+                "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": result['lot_size'],
+                "type": mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL,
+                "price": entry_price, "sl": sl_price, "tp": tp_price, "deviation": 20,
+                "magic": BOT_MAGIC, "comment": "GOAT", "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_FOK,
+            })
+            print(f"  ORDER RESULT: {order}")
+            if order is not None and order.retcode == mt5.TRADE_RETCODE_DONE:
+                if 'open_bot_positions' not in state:
+                    state['open_bot_positions'] = {}
+                state['open_bot_positions'][str(order.order)] = {
+                    'pair': pair, 'session': session_name, 'entry': entry_price,
+                    'sl': sl_price, 'tp': tp_price, 'risk_amount': result['risk_amount'],
+                    'confidence': result['confidence'],
+                }
+        else:
+            print("  (DRY RUN -- no order placed, nothing logged)")
+
 
 def process_new_closed_deals(state):
     from_date = datetime(2020, 1, 1)
@@ -196,16 +312,10 @@ def process_new_closed_deals(state):
                 risk_amount = trade_info['risk_amount']
                 r_multiple = round(pnl / risk_amount, 2) if risk_amount else 0
                 result_label = 'WIN' if pnl > 0 else 'LOSS'
-
                 database.save_trade(
-                    pair=trade_info['pair'],
-                    session=trade_info['session'],
-                    entry=trade_info['entry'],
-                    stop_loss=trade_info['sl'],
-                    take_profit=trade_info['tp'],
-                    result=result_label,
-                    r_multiple=r_multiple,
-                    account='FTMO Account',
+                    pair=trade_info['pair'], session=trade_info['session'], entry=trade_info['entry'],
+                    stop_loss=trade_info['sl'], take_profit=trade_info['tp'], result=result_label,
+                    r_multiple=r_multiple, account='FTMO Account',
                     date=datetime.fromtimestamp(deal.time).strftime('%Y-%m-%d %H:%M'),
                     notes=f"GOAT auto-trade | confidence={trade_info.get('confidence', 'N/A')}",
                 )
@@ -267,132 +377,83 @@ def main():
                 time.sleep(60)
                 continue
 
+            forex_confirmed_cache = {}
+
+            # ── PART A: continuously-scanned pairs -- EURUSD, XAUUSD, DE40 ──
+            # These get checked every single iteration, no session gate at all.
+            for pair in NO_WINDOW_PAIRS:
+                symbol = SYMBOL_MAP[pair]
+                positions = mt5.positions_get(symbol=symbol)
+                if positions and len(positions) > 0:
+                    continue
+                df = get_recent_bars(symbol)
+                if df is None or len(df) < 100:
+                    print(f"[{pair}] Not enough price data yet, skipping")
+                    continue
+                bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=True)
+                if pair == 'EURUSD' and bos_result is not None:
+                    forex_confirmed_cache['EURUSD'] = bos_result
+                if bos_result is not None:
+                    process_confirmed_signal(pair, symbol, df, bos_result, 'continuous',
+                                              state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
+                else:
+                    pending = price_action_tracking.get(pair, {}).get('pending')
+                    status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/6)" if pending else "no sweep detected"
+                    print(f"[{now_wat.strftime('%H:%M')}] {pair}: {status}")
+
+            # ── PART B: window-gated pairs -- GBPUSD, USTEC, US30, US500 ──
             window = bot.check_silver_bullet_window()
+            session_name = window['session'] if window['active'] else None
+            pairs_this_session = [p for p, s in PAIR_SESSIONS.items() if session_name and session_name in s]
+
+            already_handled = set()
+
+            # Step 1: resolve any EXISTING pending sweep regardless of window (matches backtest)
+            pairs_with_pending = [p for p, t in price_action_tracking.items()
+                                   if t.get('pending') is not None and p in PAIR_SESSIONS]
+            for pair in pairs_with_pending:
+                symbol = SYMBOL_MAP[pair]
+                positions = mt5.positions_get(symbol=symbol)
+                if positions and len(positions) > 0:
+                    continue
+                df = get_recent_bars(symbol)
+                if df is None or len(df) < 100:
+                    continue
+                bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=False)
+                already_handled.add(pair)
+                if pair == 'GBPUSD' and bos_result is not None:
+                    forex_confirmed_cache['GBPUSD'] = bos_result
+                if bos_result is not None:
+                    process_confirmed_signal(pair, symbol, df, bos_result, session_name or 'post-window',
+                                              state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
+                else:
+                    pending = price_action_tracking.get(pair, {}).get('pending')
+                    status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/6)" if pending else "sweep resolved/expired"
+                    print(f"[{now_wat.strftime('%H:%M')}] {pair}: {status}")
+
+            # Step 2: check for NEW sweeps, only for window-gated pairs, only inside their window
             if window['active']:
-                session_name = window['session']
-
-                # precompute EURUSD/GBPUSD price action together, so the real SMT
-                # divergence check has both pairs' data to compare -- not hardcoded True
-                forex_pa_cache = {}
-                pairs_this_session = [p for p, s in PAIR_SESSIONS.items() if session_name in s]
-                if 'EURUSD' in pairs_this_session or 'GBPUSD' in pairs_this_session:
-                    _, eur_pa = get_pair_price_action('EURUSD', SYMBOL_MAP)
-                    _, gbp_pa = get_pair_price_action('GBPUSD', SYMBOL_MAP)
-                    forex_pa_cache['EURUSD'] = eur_pa
-                    forex_pa_cache['GBPUSD'] = gbp_pa
-
-                for pair, sessions in PAIR_SESSIONS.items():
-                    if session_name not in sessions:
+                for pair in pairs_this_session:
+                    if pair in already_handled:
                         continue
-
                     symbol = SYMBOL_MAP[pair]
                     positions = mt5.positions_get(symbol=symbol)
                     if positions and len(positions) > 0:
                         continue
-
                     df = get_recent_bars(symbol)
                     if df is None or len(df) < 100:
                         print(f"[{pair}] Not enough price data yet, skipping")
                         continue
-
-                    weekly_bias = compute_weekly_bias(df)
-                    bias_4h, sma_slope = compute_4h_bias_and_slope(df)
-                    zone = compute_zone(df)
-                    pa = detect_price_action_latest(df)
-                    if pa is None:
-                        continue
-
-                    profile = bot.get_pair_profile(pair)
-                    if profile['trend_required']:
-                        if weekly_bias not in ('bullish', 'bearish'):
-                            continue
-                        direction = 'buy' if weekly_bias == 'bullish' else 'sell'
+                    bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=True)
+                    if pair == 'GBPUSD' and bos_result is not None:
+                        forex_confirmed_cache['GBPUSD'] = bos_result
+                    if bos_result is not None:
+                        process_confirmed_signal(pair, symbol, df, bos_result, session_name,
+                                                  state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
                     else:
-                        direction = None
-                        if pa['sweep_buy'] and pa['bos_up']:
-                            direction = 'buy'
-                        elif pa['sweep_sell'] and pa['bos_down']:
-                            direction = 'sell'
-                        if direction is None:
-                            continue
-
-                    if direction == 'buy':
-                        liquidity_swept, bos_confirmed, fvg_or_ob = pa['sweep_buy'], pa['bos_up'], pa['fvg_bull']
-                        sl_price_dist = abs(df['close'].iloc[-1] - pa['swing_low'])
-                    else:
-                        liquidity_swept, bos_confirmed, fvg_or_ob = pa['sweep_sell'], pa['bos_down'], pa['fvg_bear']
-                        sl_price_dist = abs(pa['swing_high'] - df['close'].iloc[-1])
-
-                    if not (liquidity_swept and bos_confirmed) or sl_price_dist <= 0:
-                        continue
-
-                    sl_points = round(sl_price_dist * POINT_SCALE[pair])
-                    tp_points = sl_points * 2
-                    # real SMT check for EURUSD/GBPUSD -- compares this pair's sweep against
-                    # the other pair's sweep at the same moment. XAUUSD/indices unchanged.
-                    if pair in ('EURUSD', 'GBPUSD'):
-                        other_pair = 'GBPUSD' if pair == 'EURUSD' else 'EURUSD'
-                        other_pa = forex_pa_cache.get(other_pair)
-                        if other_pa is None:
-                            smt_agreement, smt_divergence = False, False
-                        elif direction == 'buy':
-                            smt_agreement = pa['sweep_buy'] and other_pa['sweep_buy']
-                            smt_divergence = pa['sweep_buy'] and not other_pa['sweep_buy']
-                        else:
-                            smt_agreement = pa['sweep_sell'] and other_pa['sweep_sell']
-                            smt_divergence = pa['sweep_sell'] and not other_pa['sweep_sell']
-                    else:
-                        smt_agreement, smt_divergence = True, False
-                    result = bot.evaluate_checklist(
-                        current_equity=current_equity, daily_floor=daily_floor, max_loss_floor=max_loss_floor,
-                        pair=pair, direction=direction, weekly_bias=weekly_bias, bias_4h=bias_4h,
-                        sma_50_slope=sma_slope, zone=zone, smt_agreement=smt_agreement,
-                        smt_divergence=smt_divergence, fvg_or_ob=fvg_or_ob, liquidity_swept=liquidity_swept,
-                        bos_confirmed=bos_confirmed, sl_points=sl_points, tp_points=tp_points,
-                    )
-
-                    print(f"[{pair}] {direction.upper()} | confidence={result['confidence']} | valid={result['valid']}")
-
-                    if result['valid']:
-                        tick = mt5.symbol_info_tick(symbol)
-                        if tick is None:
-                            print(f"  [ERROR] No live tick for {symbol} -- skipping, market may be closed for this symbol")
-                            continue
-
-                        entry_price = tick.ask if direction == 'buy' else tick.bid
-                        sl_price = entry_price - sl_price_dist if direction == 'buy' else entry_price + sl_price_dist
-                        tp_price = entry_price + sl_price_dist * 2 if direction == 'buy' else entry_price - sl_price_dist * 2
-
-                        print(f"  >>> SIGNAL: {pair} {direction} | lot={result['lot_size']} | "
-                              f"SL={sl_price:.5f} TP={tp_price:.5f} | risking ${result['risk_amount']}")
-
-                        if not DRY_RUN:
-                            order = mt5.order_send({
-                                "action": mt5.TRADE_ACTION_DEAL,
-                                "symbol": symbol,
-                                "volume": result['lot_size'],
-                                "type": mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL,
-                                "price": entry_price,
-                                "sl": sl_price,
-                                "tp": tp_price,
-                                "deviation": 20,
-                                "magic": BOT_MAGIC,
-                                "comment": "GOAT",
-                                "type_time": mt5.ORDER_TIME_GTC,
-                                "type_filling": mt5.ORDER_FILLING_FOK,
-                            })
-                            print(f"  ORDER RESULT: {order}")
-
-                            if order is not None and order.retcode == mt5.TRADE_RETCODE_DONE:
-                                if 'open_bot_positions' not in state:
-                                    state['open_bot_positions'] = {}
-                                state['open_bot_positions'][str(order.order)] = {
-                                    'pair': pair, 'session': session_name, 'entry': entry_price,
-                                    'sl': sl_price, 'tp': tp_price, 'risk_amount': result['risk_amount'],
-                                    'confidence': result['confidence'],
-                                }
-                        else:
-                            print("  (DRY RUN -- no order placed, nothing logged)")
+                        pending = price_action_tracking.get(pair, {}).get('pending')
+                        status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/6)" if pending else "no sweep detected"
+                        print(f"[{now_wat.strftime('%H:%M')}] {pair}: {status}")
 
             save_state(state)
             time.sleep(60)

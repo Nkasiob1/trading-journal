@@ -110,9 +110,11 @@ UTC = pytz.UTC
 # IMPORTANT: this list starts EMPTY. Until you populate it, the bot has NO calendar
 # protection at all -- it will not block trading around any scheduled news event.
 STATIC_BLACKOUT_EVENTS = [
-    # ('2026-07-04', '12:30', 'US Non-Farm Payrolls', 'high'),
-    # ('2026-07-15', '12:30', 'US CPI', 'high'),
-    # ('2026-07-30', '18:00', 'FOMC Rate Decision', 'high'),
+    ('2026-07-23', '12:15', 'ECB Rate Decision', 'high'),
+    ('2026-07-29', '11:00', 'BoE Rate Decision', 'high'),
+    ('2026-07-29', '18:00', 'FOMC Rate Decision', 'high'),
+    ('2026-08-07', '12:30', 'US Non-Farm Payrolls', 'high'),
+    ('2026-08-12', '12:30', 'US CPI', 'high'),
 ]
 
 def get_economic_calendar(target_date=None):
