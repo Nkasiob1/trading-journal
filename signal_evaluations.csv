@@ -1,0 +1,3 @@
+timestamp,pair,direction,confidence,valid,account_status,news_check,market_open,silver_bullet_window,weekly_bias,bias_4h,zone,smt,price_action_5m,rr_ratio,rejected_because
+2026-07-28 03:05:00,GBPUSD,sell,85.0,False,True,True,True,False,True,True,False,False,True,True,Window; Zone; SMT
+2026-07-28 10:55:00,EURUSD,sell,85.0,False,True,True,True,True,True,True,False,False,True,True,Zone; SMT

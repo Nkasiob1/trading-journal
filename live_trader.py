@@ -1,46 +1,70 @@
 # live_trader.py
-# GOAT Live Execution -- v2.0, instrument-specific session scanning
+# GOAT Live Execution -- v3.0, Mean-Reversion engine added
 #
-# THE CHANGE: EURUSD, XAUUSD, and DE40 are now scanned EVERY loop iteration, any hour,
-# any day (weekends/Friday-close excepted) -- not restricted to their old Silver Bullet
-# windows. This is backed by a full 16-month backtest: this combination gave 65 trades,
-# 56.9% win rate, +$3,381.64 -- the best result found across every configuration tested.
+# v3.0 CHANGE: added the mean-reversion engine (mean_reversion.py) -- three independent
+# strategies (Bollinger+RSI14, RSI2, VWAP deviation) running on all 7 instruments, every
+# loop iteration, completely independent of the ICT engine's Silver Bullet windows.
+# Tagged with its own magic number (MR_MAGIC) so it's tracked separately in the journal
+# and has its OWN kill switch counter -- a losing streak in one engine should not wrongly
+# pause the other, same reasoning as why manual trades stay separate from bot trades.
 #
-# GBPUSD, US500, USTEC, and US30 KEEP their original window-gated behavior -- backtesting
-# showed these get WORSE or contribute nothing when unrestricted.
+# REAL DESIGN CHOICES, stated plainly:
+#   - Fixed $4.00 risk per trade for mean reversion (not the ICT engine's PAIR_RISK table)
+#     -- this exact number is what was backtested and validated, do not change casually
+#   - NO one-trade-per-pair lock for mean reversion -- multiple overlapping positions on
+#     the same instrument are allowed. This matches exactly what was backtested (the
+#     $1,000/quarter, 75% hit-rate result). Your account is in Hedge mode, so this is
+#     technically supported.
+#   - Account-wide MAX_LOSS_PCT tightened to 9% (in bot.py) -- applies to BOTH engines,
+#     since it's one real account with one real drawdown floor
+#   - Real FTMO news blackout calendar stays a hard requirement for mean reversion too
+#   - Added has_opposing_position() -- stops either engine from opening a trade AGAINST
+#     a position the other engine already holds on the same instrument. Same-direction
+#     overlap (both engines agreeing) is still allowed.
 #
-# Everything else unchanged from v1.5: magic-number trade separation, journal logging,
-# real SMT cross-check, signal chart saving, weekly/4H bias pulled from real MT5 data,
-# multi-bar sweep tracking with cross-window resolution for the windowed pairs.
+# v2.2 CHANGE (kept): bos_window=12 for the ICT engine (backtested best single change:
+# 321 trades, +$10,451.74 vs +$8,556.99 at bos_window=6). Rejection-distance logging on
+# every pending sweep. Persistent CSV logging (signal_evaluations.csv) of every ICT
+# signal evaluated, pass or fail.
+#
+# v2.1 CHANGE (kept): fixed the ICT engine's SMT tautology bug -- smt_divergence now
+# requires the other pair to have ACTUALLY confirmed something, not just "no data".
+#
+# v2.0 CHANGE (kept): EURUSD, XAUUSD, DE40 scan continuously for the ICT engine (no
+# window restriction). GBPUSD, US500, USTEC, US30 keep window-gated behavior.
+#
+# DRY_RUN = False -- real order placement is live on the FTMO demo account.
 
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import json
 import time
+import csv
+import os
 from datetime import datetime, date
 import pytz
 import bot
+import mean_reversion as mr
 import database
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-DRY_RUN = True
+DRY_RUN = False
 
 WAT = pytz.timezone('Africa/Lagos')
 CET = pytz.timezone('Europe/Prague')
 
 STATE_FILE = 'goat_state.json'
-BOT_MAGIC = 234000
+BOT_MAGIC = 234000       # ICT engine
+MR_MAGIC = 234001        # Mean-reversion engine -- separate, so journal/kill-switch don't cross-contaminate
 
 SYMBOL_MAP = {
     'EURUSD': 'EURUSD', 'GBPUSD': 'GBPUSD', 'XAUUSD': 'XAUUSD',
     'USTEC': 'US100.cash', 'US30': 'US30.cash', 'US500': 'US500.cash', 'DE40': 'GER40.cash',
 }
 
-# GBPUSD, US500, USTEC, US30 keep their session windows -- backed by backtest evidence
-# that these specific instruments perform WORSE or contribute nothing when unrestricted.
 PAIR_SESSIONS = {
     'GBPUSD': ['Asian KZ', 'London Open KZ', 'London', 'Forex NY'],
     'USTEC':  ['NASDAQ PM'],
@@ -48,14 +72,15 @@ PAIR_SESSIONS = {
     'US500':  ['NASDAQ PM'],
 }
 
-# EURUSD, XAUUSD, DE40 scan continuously -- backed by backtest evidence these three
-# genuinely perform BETTER without the window restriction (56.9% combined win rate).
 NO_WINDOW_PAIRS = ['EURUSD', 'XAUUSD', 'DE40']
 
 POINT_SCALE = {'EURUSD': 100000, 'GBPUSD': 100000, 'XAUUSD': 100,
                 'USTEC': 1, 'US30': 1, 'US500': 1, 'DE40': 1}
 
 price_action_tracking = {}
+
+REJECTION_LOG_FILE = 'signal_evaluations.csv'
+MR_LOG_FILE = 'mean_reversion_signals.csv'
 
 
 def load_state():
@@ -68,9 +93,12 @@ def load_state():
             'daily_pnl_by_date': {},
             'bot_consecutive_losses': 0,
             'last_bot_loss_ts': None,
+            'mr_consecutive_losses': 0,
+            'last_mr_loss_ts': None,
             'last_seen_cet_date': None,
             'last_processed_deal_ticket': 0,
             'open_bot_positions': {},
+            'open_mr_positions': {},
         }
 
 def save_state(state):
@@ -102,7 +130,11 @@ def get_recent_bars(symbol, n=300):
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     df = df.set_index('time')
-    return df[['open', 'high', 'low', 'close']]
+    df = df.rename(columns={'tick_volume': 'tickvol'})
+    cols = ['open', 'high', 'low', 'close']
+    if 'tickvol' in df.columns:
+        cols.append('tickvol')
+    return df[cols]
 
 def compute_weekly_bias(symbol):
     weekly_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_W1, 0, 10)
@@ -135,7 +167,7 @@ def compute_zone(df):
     return 'discount' if df['close'].iloc[-1] < mid else 'premium'
 
 
-def update_price_action_state(pair, df, tracking, lookback=12, bos_window=6, allow_new_sweep=True):
+def update_price_action_state(pair, df, tracking, lookback=12, bos_window=12, allow_new_sweep=True):
     highs, lows, closes = df['high'].values, df['low'].values, df['close'].values
     n = len(df)
     if n < lookback + 3:
@@ -161,6 +193,16 @@ def update_price_action_state(pair, df, tracking, lookback=12, bos_window=6, all
             tracking[pair]['pending'] = None
             return {'confirmed': True, 'direction': 'sell', 'swing_low': pending['recent_low'],
                     'swing_high': pending['recent_high'], 'fvg_or_ob': pending['fvg_or_ob']}
+
+        if pending['direction'] == 'buy':
+            distance = pending['recent_high'] - closes[i]
+            print(f"  {pair} BUY pending | Close={closes[i]:.5f} Need>{pending['recent_high']:.5f} "
+                  f"(short by {distance:.5f})")
+        if pending['direction'] == 'sell':
+            distance = closes[i] - pending['recent_low']
+            print(f"  {pair} SELL pending | Close={closes[i]:.5f} Need<{pending['recent_low']:.5f} "
+                  f"(short by {distance:.5f})")
+
         pending['bars_elapsed'] += 1
         if pending['bars_elapsed'] >= bos_window:
             tracking[pair]['pending'] = None
@@ -185,19 +227,88 @@ def update_price_action_state(pair, df, tracking, lookback=12, bos_window=6, all
     return None
 
 
-def save_signal_chart(df, pair, direction, entry_price, sl_price, tp_price, confidence):
+def log_signal_evaluation(pair, ts, direction, result):
+    checklist = result['checklist']
+    file_exists = os.path.isfile(REJECTION_LOG_FILE)
+    row = {
+        'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S'), 'pair': pair, 'direction': direction,
+        'confidence': result['confidence'], 'valid': result['valid'],
+        'account_status': checklist.get('account_status', {}).get('passed'),
+        'news_check': checklist.get('news_check', {}).get('passed'),
+        'market_open': checklist.get('market_open', {}).get('passed'),
+        'silver_bullet_window': checklist.get('silver_bullet_window', {}).get('passed'),
+        'weekly_bias': checklist.get('weekly_bias', {}).get('passed'),
+        'bias_4h': checklist.get('bias_4h', {}).get('passed'),
+        'zone': checklist.get('zone', {}).get('passed'),
+        'smt': checklist.get('smt', {}).get('passed'),
+        'price_action_5m': checklist.get('price_action_5m', {}).get('passed'),
+        'rr_ratio': checklist.get('rr_ratio', {}).get('passed'),
+        'rejected_because': '; '.join([
+            label for key, label in
+            [('account_status','Account'),('news_check','News'),('market_open','Market Open'),
+             ('silver_bullet_window','Window'),('weekly_bias','Weekly Bias'),('bias_4h','4H Bias'),
+             ('zone','Zone'),('smt','SMT'),('price_action_5m','Price Action'),('rr_ratio','RR')]
+            if key in checklist and not checklist[key].get('passed', False)
+        ]),
+    }
+    with open(REJECTION_LOG_FILE, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def log_mr_signal(pair, ts, strategy, direction, result):
+    file_exists = os.path.isfile(MR_LOG_FILE)
+    checklist = result['checklist']
+    row = {
+        'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S'), 'pair': pair, 'strategy': strategy,
+        'direction': direction, 'valid': result['valid'],
+        'account_status': checklist.get('account_status', {}).get('passed'),
+        'news_check': checklist.get('news_check', {}).get('passed'),
+        'market_open': checklist.get('market_open', {}).get('passed'),
+        'lot_valid': checklist.get('lot_size', {}).get('valid'),
+    }
+    with open(MR_LOG_FILE, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def has_opposing_position(symbol, my_magic, my_direction):
+    """Prevents ICT and mean-reversion from fighting each other -- blocks a new trade only
+    if the OTHER engine already has an OPPOSITE-direction position open on this symbol.
+    Same-direction overlap (both engines agreeing) is allowed; so is no conflict at all."""
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        return False
+    for p in positions:
+        if p.magic != my_magic:
+            other_direction = 'buy' if p.type == mt5.ORDER_TYPE_BUY else 'sell'
+            if other_direction != my_direction:
+                return True
+    return False
+
+
+def save_signal_chart(df, pair, direction, entry_price, sl_price, tp_price, confidence, label=""):
     fig, ax = plt.subplots(figsize=(12, 6))
     recent = df.tail(100)
     ax.plot(recent.index, recent['close'], color='white', linewidth=1)
     ax.axhline(entry_price, color='yellow', linestyle='--', label=f'Entry {entry_price:.5f}')
     ax.axhline(sl_price, color='red', linestyle='--', label=f'SL {sl_price:.5f}')
     ax.axhline(tp_price, color='green', linestyle='--', label=f'TP {tp_price:.5f}')
-    ax.set_title(f'{pair} {direction.upper()} signal -- confidence {confidence}')
+    title = f'{pair} {direction.upper()} signal'
+    if confidence is not None:
+        title += f' -- confidence {confidence}'
+    if label:
+        title = f'[{label}] ' + title
+    ax.set_title(title)
     ax.set_facecolor('black')
     fig.patch.set_facecolor('black')
     ax.tick_params(colors='white')
     ax.legend()
-    filename = f'signal_{pair}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+    filename = f'signal_{pair}_{label}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
     fig.savefig(filename, facecolor='black')
     plt.close(fig)
     print(f"  [CHART] Saved: {filename}")
@@ -227,7 +338,7 @@ def process_confirmed_signal(pair, symbol, df, bos_result, session_name, state,
         other_pair = 'GBPUSD' if pair == 'EURUSD' else 'EURUSD'
         other_result = forex_confirmed_cache.get(other_pair)
         smt_agreement = other_result is not None and other_result['direction'] == direction
-        smt_divergence = other_result is None or other_result['direction'] != direction
+        smt_divergence = other_result is not None and other_result['direction'] != direction
     else:
         smt_agreement, smt_divergence = True, False
 
@@ -240,9 +351,32 @@ def process_confirmed_signal(pair, symbol, df, bos_result, session_name, state,
         sl_points=sl_points, tp_points=tp_points,
     )
 
-    print(f"[{pair}] {direction.upper()} CONFIRMED BOS | confidence={result['confidence']} | valid={result['valid']}")
+    print(f"[ICT][{pair}] {direction.upper()} CONFIRMED BOS | confidence={result['confidence']} | valid={result['valid']}")
+    log_signal_evaluation(pair, df.index[-1], direction, result)
+    checklist = result['checklist']
+    check_labels = {
+        'account_status': 'Account', 'news_check': 'News', 'market_open': 'Market Open',
+        'silver_bullet_window': 'Window', 'weekly_bias': 'Weekly Bias', 'bias_4h': '4H Bias',
+        'zone': 'Zone', 'smt': 'SMT', 'price_action_5m': 'Price Action', 'rr_ratio': 'RR',
+    }
+    failed_items = []
+    line_parts = []
+    for key, label in check_labels.items():
+        if key in checklist:
+            passed = checklist[key].get('passed', False)
+            mark = '\u2713' if passed else '\u2717'
+            line_parts.append(f"{label} {mark}")
+            if not passed:
+                failed_items.append(label)
+    print(f"  {' | '.join(line_parts)}")
+    if failed_items:
+        print(f"  Rejected because: {', '.join(failed_items)}")
 
     if result['valid']:
+        if has_opposing_position(symbol, BOT_MAGIC, direction):
+            print(f"  [SKIPPED] Mean-reversion already holds an opposite-direction position on {pair} -- not opening ICT trade against it")
+            return
+
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             print(f"  [ERROR] No live tick for {symbol} -- skipping")
@@ -252,17 +386,17 @@ def process_confirmed_signal(pair, symbol, df, bos_result, session_name, state,
         sl_price = entry_price - sl_price_dist if direction == 'buy' else entry_price + sl_price_dist
         tp_price = entry_price + sl_price_dist * 2 if direction == 'buy' else entry_price - sl_price_dist * 2
 
-        print(f"  >>> SIGNAL: {pair} {direction} | lot={result['lot_size']} | "
+        print(f"  >>> ICT SIGNAL: {pair} {direction} | lot={result['lot_size']} | "
               f"SL={sl_price:.5f} TP={tp_price:.5f} | risking ${result['risk_amount']}")
 
-        save_signal_chart(df, pair, direction, entry_price, sl_price, tp_price, result['confidence'])
+        save_signal_chart(df, pair, direction, entry_price, sl_price, tp_price, result['confidence'], label="ICT")
 
         if not DRY_RUN:
             order = mt5.order_send({
                 "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": result['lot_size'],
                 "type": mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL,
                 "price": entry_price, "sl": sl_price, "tp": tp_price, "deviation": 20,
-                "magic": BOT_MAGIC, "comment": "GOAT", "type_time": mt5.ORDER_TIME_GTC,
+                "magic": BOT_MAGIC, "comment": "GOAT-ICT", "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_FOK,
             })
             print(f"  ORDER RESULT: {order}")
@@ -276,6 +410,70 @@ def process_confirmed_signal(pair, symbol, df, bos_result, session_name, state,
                 }
         else:
             print("  (DRY RUN -- no order placed, nothing logged)")
+
+
+def process_mr_signal(pair, symbol, df, sig, state, current_equity, daily_floor, max_loss_floor):
+    """Mean-reversion signal handler -- deliberately independent of the ICT engine's logic."""
+    direction = sig['direction']
+    strategy = sig['strategy']
+    atr = sig['atr']
+    sl_dist = atr * mr.SL_ATR_MULT
+    tp_dist = sl_dist * mr.TP_ATR_MULT   # true 3:1, per the corrected math (risk $4 -> gain $12)
+
+    result = bot.evaluate_mean_reversion_signal(
+        current_equity=current_equity, daily_floor=daily_floor, max_loss_floor=max_loss_floor,
+        pair=pair, direction=direction, sl_dist=sl_dist,
+        point_scale=POINT_SCALE[pair], point_value=bot.POINT_VALUES[pair],
+    )
+
+    print(f"[MR][{pair}] {strategy} {direction.upper()} | valid={result['valid']}")
+    log_mr_signal(pair, df.index[-1], strategy, direction, result)
+    if not result['valid']:
+        failed = [k for k, v in result['checklist'].items() if isinstance(v, dict) and 'passed' in v and not v['passed']]
+        if failed:
+            print(f"  Rejected because: {', '.join(failed)}")
+        return
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        print(f"  [ERROR] No live tick for {symbol} -- skipping")
+        return
+
+    entry_price = tick.ask if direction == 'buy' else tick.bid
+    if direction == 'buy':
+        sl_price = entry_price - sl_dist
+        tp_price = entry_price + tp_dist
+    else:
+        sl_price = entry_price + sl_dist
+        tp_price = entry_price - tp_dist
+
+    print(f"  >>> MR SIGNAL: {pair} {strategy} {direction} | lot={result['lot_size']} | "
+          f"SL={sl_price:.5f} TP={tp_price:.5f} | risking ${result['risk_amount']}")
+
+    if has_opposing_position(symbol, MR_MAGIC, direction):
+        print(f"  [SKIPPED] ICT engine already holds an opposite-direction position on {pair} -- not opening MR trade against it")
+        return
+
+    save_signal_chart(df, pair, direction, entry_price, sl_price, tp_price, None, label=f"MR-{strategy}")
+
+    if not DRY_RUN:
+        order = mt5.order_send({
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": result['lot_size'],
+            "type": mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL,
+            "price": entry_price, "sl": sl_price, "tp": tp_price, "deviation": 20,
+            "magic": MR_MAGIC, "comment": f"GOAT-MR-{strategy}", "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        })
+        print(f"  ORDER RESULT: {order}")
+        if order is not None and order.retcode == mt5.TRADE_RETCODE_DONE:
+            if 'open_mr_positions' not in state:
+                state['open_mr_positions'] = {}
+            state['open_mr_positions'][str(order.order)] = {
+                'pair': pair, 'strategy': strategy, 'entry': entry_price,
+                'sl': sl_price, 'tp': tp_price, 'risk_amount': result['risk_amount'],
+            }
+    else:
+        print("  (DRY RUN -- no order placed, nothing logged)")
 
 
 def process_new_closed_deals(state):
@@ -295,19 +493,17 @@ def process_new_closed_deals(state):
         deal_date_cet = str(datetime.fromtimestamp(deal.time).astimezone(CET).date())
         state['daily_pnl_by_date'][deal_date_cet] = state['daily_pnl_by_date'].get(deal_date_cet, 0) + pnl
 
-        is_bot_trade = (deal.magic == BOT_MAGIC)
-        if is_bot_trade:
+        if deal.magic == BOT_MAGIC:
             if pnl < 0:
                 state['bot_consecutive_losses'] += 1
                 state['last_bot_loss_ts'] = datetime.now(WAT).isoformat()
-                print(f"[BOT TRADE CLOSED] Loss: ${pnl:.2f} -- bot consecutive losses now {state['bot_consecutive_losses']}")
+                print(f"[ICT TRADE CLOSED] Loss: ${pnl:.2f} -- ICT consecutive losses now {state['bot_consecutive_losses']}")
             elif pnl > 0:
                 state['bot_consecutive_losses'] = 0
-                print(f"[BOT TRADE CLOSED] Win: ${pnl:.2f} -- bot consecutive losses reset")
+                print(f"[ICT TRADE CLOSED] Win: ${pnl:.2f} -- ICT consecutive losses reset")
 
             position_key = str(deal.position_id)
             trade_info = state.get('open_bot_positions', {}).pop(position_key, None)
-
             if trade_info is not None:
                 risk_amount = trade_info['risk_amount']
                 r_multiple = round(pnl / risk_amount, 2) if risk_amount else 0
@@ -317,13 +513,40 @@ def process_new_closed_deals(state):
                     stop_loss=trade_info['sl'], take_profit=trade_info['tp'], result=result_label,
                     r_multiple=r_multiple, account='FTMO Account',
                     date=datetime.fromtimestamp(deal.time).strftime('%Y-%m-%d %H:%M'),
-                    notes=f"GOAT auto-trade | confidence={trade_info.get('confidence', 'N/A')}",
+                    notes=f"GOAT-ICT auto-trade | confidence={trade_info.get('confidence', 'N/A')}",
                 )
-                print(f"  [JOURNAL] Logged to database: {trade_info['pair']} {result_label} ({r_multiple}R)")
+                print(f"  [JOURNAL] Logged: {trade_info['pair']} {result_label} ({r_multiple}R)")
             else:
-                print(f"  [WARNING] Bot trade closed but no matching open-trade record found -- not logged to journal")
+                print(f"  [WARNING] ICT trade closed but no matching open-trade record found")
+
+        elif deal.magic == MR_MAGIC:
+            if pnl < 0:
+                state['mr_consecutive_losses'] += 1
+                state['last_mr_loss_ts'] = datetime.now(WAT).isoformat()
+                print(f"[MR TRADE CLOSED] Loss: ${pnl:.2f} -- MR consecutive losses now {state['mr_consecutive_losses']}")
+            elif pnl > 0:
+                state['mr_consecutive_losses'] = 0
+                print(f"[MR TRADE CLOSED] Win: ${pnl:.2f} -- MR consecutive losses reset")
+
+            position_key = str(deal.position_id)
+            trade_info = state.get('open_mr_positions', {}).pop(position_key, None)
+            if trade_info is not None:
+                risk_amount = trade_info['risk_amount']
+                r_multiple = round(pnl / risk_amount, 2) if risk_amount else 0
+                result_label = 'WIN' if pnl > 0 else 'LOSS'
+                database.save_trade(
+                    pair=trade_info['pair'], session=f"MeanReversion-{trade_info['strategy']}",
+                    entry=trade_info['entry'], stop_loss=trade_info['sl'], take_profit=trade_info['tp'],
+                    result=result_label, r_multiple=r_multiple, account='FTMO Account',
+                    date=datetime.fromtimestamp(deal.time).strftime('%Y-%m-%d %H:%M'),
+                    notes=f"GOAT-MR auto-trade | strategy={trade_info['strategy']}",
+                )
+                print(f"  [JOURNAL] Logged: {trade_info['pair']} MR-{trade_info['strategy']} {result_label} ({r_multiple}R)")
+            else:
+                print(f"  [WARNING] MR trade closed but no matching open-trade record found")
+
         else:
-            print(f"[MANUAL TRADE CLOSED] P&L: ${pnl:.2f} -- counted toward account P&L, not the bot's kill switch")
+            print(f"[MANUAL TRADE CLOSED] P&L: ${pnl:.2f} -- counted toward account P&L, not any bot kill switch")
 
         state['last_processed_deal_ticket'] = max(state['last_processed_deal_ticket'], deal.ticket)
 
@@ -341,6 +564,9 @@ def main():
     database.init_db()
     select_all_symbols()
     state = load_state()
+    for key in ['mr_consecutive_losses', 'last_mr_loss_ts', 'open_mr_positions']:
+        if key not in state:
+            state[key] = 0 if 'losses' in key else (None if 'ts' in key else {})
 
     try:
         while True:
@@ -364,96 +590,113 @@ def main():
 
             acc_status = bot.check_account_status(current_equity, daily_floor, max_loss_floor)
             if not acc_status['can_trade']:
-                print(f"[BLOCKED] {acc_status['reason']}")
+                print(f"[BLOCKED -- ACCOUNT WIDE] {acc_status['reason']}")
                 save_state(state)
                 time.sleep(60)
                 continue
 
+            # ── ICT engine kill switch (own counter) ──
             last_loss_ts = datetime.fromisoformat(state['last_bot_loss_ts']) if state['last_bot_loss_ts'] else None
-            kill = bot.check_kill_switch(state['bot_consecutive_losses'], last_loss_ts)
-            if kill['triggered']:
-                print(f"[KILL SWITCH] {kill['reason']}")
-                save_state(state)
-                time.sleep(60)
-                continue
+            ict_kill = bot.check_kill_switch(state['bot_consecutive_losses'], last_loss_ts)
+            ict_paused = ict_kill['triggered']
+            if ict_paused:
+                print(f"[ICT KILL SWITCH] {ict_kill['reason']}")
+
+            # ── Mean-reversion kill switch (own, separate counter) ──
+            last_mr_loss_ts = datetime.fromisoformat(state['last_mr_loss_ts']) if state['last_mr_loss_ts'] else None
+            mr_kill = bot.check_kill_switch(state['mr_consecutive_losses'], last_mr_loss_ts)
+            mr_paused = mr_kill['triggered']
+            if mr_paused:
+                print(f"[MR KILL SWITCH] {mr_kill['reason']}")
 
             forex_confirmed_cache = {}
 
-            # ── PART A: continuously-scanned pairs -- EURUSD, XAUUSD, DE40 ──
-            # These get checked every single iteration, no session gate at all.
-            for pair in NO_WINDOW_PAIRS:
-                symbol = SYMBOL_MAP[pair]
-                positions = mt5.positions_get(symbol=symbol)
-                if positions and len(positions) > 0:
-                    continue
-                df = get_recent_bars(symbol)
-                if df is None or len(df) < 100:
-                    print(f"[{pair}] Not enough price data yet, skipping")
-                    continue
-                bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=True)
-                if pair == 'EURUSD' and bos_result is not None:
-                    forex_confirmed_cache['EURUSD'] = bos_result
-                if bos_result is not None:
-                    process_confirmed_signal(pair, symbol, df, bos_result, 'continuous',
-                                              state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
-                else:
-                    pending = price_action_tracking.get(pair, {}).get('pending')
-                    status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/6)" if pending else "no sweep detected"
-                    print(f"[{now_wat.strftime('%H:%M')}] {pair}: {status}")
-
-            # ── PART B: window-gated pairs -- GBPUSD, USTEC, US30, US500 ──
-            window = bot.check_silver_bullet_window()
-            session_name = window['session'] if window['active'] else None
-            pairs_this_session = [p for p, s in PAIR_SESSIONS.items() if session_name and session_name in s]
-
-            already_handled = set()
-
-            # Step 1: resolve any EXISTING pending sweep regardless of window (matches backtest)
-            pairs_with_pending = [p for p, t in price_action_tracking.items()
-                                   if t.get('pending') is not None and p in PAIR_SESSIONS]
-            for pair in pairs_with_pending:
-                symbol = SYMBOL_MAP[pair]
-                positions = mt5.positions_get(symbol=symbol)
-                if positions and len(positions) > 0:
-                    continue
-                df = get_recent_bars(symbol)
-                if df is None or len(df) < 100:
-                    continue
-                bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=False)
-                already_handled.add(pair)
-                if pair == 'GBPUSD' and bos_result is not None:
-                    forex_confirmed_cache['GBPUSD'] = bos_result
-                if bos_result is not None:
-                    process_confirmed_signal(pair, symbol, df, bos_result, session_name or 'post-window',
-                                              state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
-                else:
-                    pending = price_action_tracking.get(pair, {}).get('pending')
-                    status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/6)" if pending else "sweep resolved/expired"
-                    print(f"[{now_wat.strftime('%H:%M')}] {pair}: {status}")
-
-            # Step 2: check for NEW sweeps, only for window-gated pairs, only inside their window
-            if window['active']:
-                for pair in pairs_this_session:
-                    if pair in already_handled:
-                        continue
+            # ══════════════════ ICT ENGINE ══════════════════
+            if not ict_paused:
+                for pair in NO_WINDOW_PAIRS:
                     symbol = SYMBOL_MAP[pair]
                     positions = mt5.positions_get(symbol=symbol)
-                    if positions and len(positions) > 0:
+                    if positions and any(p.magic == BOT_MAGIC for p in positions):
                         continue
                     df = get_recent_bars(symbol)
                     if df is None or len(df) < 100:
                         print(f"[{pair}] Not enough price data yet, skipping")
                         continue
                     bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=True)
-                    if pair == 'GBPUSD' and bos_result is not None:
-                        forex_confirmed_cache['GBPUSD'] = bos_result
+                    if pair == 'EURUSD' and bos_result is not None:
+                        forex_confirmed_cache['EURUSD'] = bos_result
                     if bos_result is not None:
-                        process_confirmed_signal(pair, symbol, df, bos_result, session_name,
+                        process_confirmed_signal(pair, symbol, df, bos_result, 'continuous',
                                                   state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
                     else:
                         pending = price_action_tracking.get(pair, {}).get('pending')
-                        status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/6)" if pending else "no sweep detected"
-                        print(f"[{now_wat.strftime('%H:%M')}] {pair}: {status}")
+                        status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/12)" if pending else "no sweep detected"
+                        print(f"[ICT][{now_wat.strftime('%H:%M')}] {pair}: {status}")
+
+                window = bot.check_silver_bullet_window()
+                session_name = window['session'] if window['active'] else None
+                pairs_this_session = [p for p, s in PAIR_SESSIONS.items() if session_name and session_name in s]
+                already_handled = set()
+
+                pairs_with_pending = [p for p, t in price_action_tracking.items()
+                                       if t.get('pending') is not None and p in PAIR_SESSIONS]
+                for pair in pairs_with_pending:
+                    symbol = SYMBOL_MAP[pair]
+                    positions = mt5.positions_get(symbol=symbol)
+                    if positions and any(p.magic == BOT_MAGIC for p in positions):
+                        continue
+                    df = get_recent_bars(symbol)
+                    if df is None or len(df) < 100:
+                        continue
+                    bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=False)
+                    already_handled.add(pair)
+                    if pair == 'GBPUSD' and bos_result is not None:
+                        forex_confirmed_cache['GBPUSD'] = bos_result
+                    if bos_result is not None:
+                        process_confirmed_signal(pair, symbol, df, bos_result, session_name or 'post-window',
+                                                  state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
+                    else:
+                        pending = price_action_tracking.get(pair, {}).get('pending')
+                        status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/12)" if pending else "sweep resolved/expired"
+                        print(f"[ICT][{now_wat.strftime('%H:%M')}] {pair}: {status}")
+
+                if window['active']:
+                    for pair in pairs_this_session:
+                        if pair in already_handled:
+                            continue
+                        symbol = SYMBOL_MAP[pair]
+                        positions = mt5.positions_get(symbol=symbol)
+                        if positions and any(p.magic == BOT_MAGIC for p in positions):
+                            continue
+                        df = get_recent_bars(symbol)
+                        if df is None or len(df) < 100:
+                            print(f"[{pair}] Not enough price data yet, skipping")
+                            continue
+                        bos_result = update_price_action_state(pair, df, price_action_tracking, allow_new_sweep=True)
+                        if pair == 'GBPUSD' and bos_result is not None:
+                            forex_confirmed_cache['GBPUSD'] = bos_result
+                        if bos_result is not None:
+                            process_confirmed_signal(pair, symbol, df, bos_result, session_name,
+                                                      state, current_equity, daily_floor, max_loss_floor, forex_confirmed_cache)
+                        else:
+                            pending = price_action_tracking.get(pair, {}).get('pending')
+                            status = f"tracking pending {pending['direction']} sweep (bar {pending['bars_elapsed']}/12)" if pending else "no sweep detected"
+                            print(f"[ICT][{now_wat.strftime('%H:%M')}] {pair}: {status}")
+
+            # ══════════════════ MEAN REVERSION ENGINE ══════════════════
+            # All 7 pairs, every iteration, no session windows -- independent of the ICT engine.
+            # No one-trade-per-pair lock, by design (see header note).
+            if not mr_paused:
+                for pair, symbol in SYMBOL_MAP.items():
+                    df_mr = get_recent_bars(symbol, n=300)
+                    if df_mr is None or len(df_mr) < 205:
+                        continue
+                    df_mr = mr.compute_indicators(df_mr)
+                    signals = mr.check_signal(df_mr)
+                    for sig in signals:
+                        process_mr_signal(pair, symbol, df_mr, sig, state, current_equity, daily_floor, max_loss_floor)
+                    if not signals:
+                        pass  # quiet -- MR doesn't print a "no signal" heartbeat for all 7 pairs every minute, too noisy
 
             save_state(state)
             time.sleep(60)

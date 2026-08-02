@@ -1,21 +1,30 @@
 # bot.py
 # GOAT Trading Bot - Rule Engine
-# v5.0 -- Instrument-specific session scanning
+# v7.0 -- Mean-reversion module added, account-wide max-loss tightened to 9%
 #
-# CHANGE FROM v4.0: added `window_required` to PAIR_PROFILES, backed by a full 16-month
-# backtest comparing windowed-only vs 24/7 scanning vs several hybrid combinations.
+# v7.0 CHANGE: MAX_LOSS_PCT tightened from 0.10 (FTMO's real limit) to 0.09 -- a self-
+# imposed 1% safety buffer below the real breach point, validated across a full
+# mean-reversion backtest (8 independent quarters, 6 of 8 reached $1,000+ peak profit
+# before any breach at this threshold). This applies account-wide, to both the ICT
+# engine and the new mean-reversion engine, since it's a single real FTMO account with
+# one real drawdown floor.
 #
-# RESULT THAT DROVE THIS: DE40, XAUUSD, and EURUSD perform BETTER when scanned continuously
-# (not restricted to their old Silver Bullet windows) -- 65 trades, 56.9% win rate, +$3,381.64
-# over the backtest period, the best result found across every configuration tested.
-# USTEC, US30, GBPUSD, and US500 all got WORSE or contributed nothing when unrestricted --
-# these keep their original window-gated behavior.
+# Added evaluate_mean_reversion_signal() -- a deliberately SIMPLER evaluation path for
+# the new mean-reversion strategies (Bollinger+RSI14, RSI2, VWAP -- see mean_reversion.py).
+# Does NOT use the ICT checklist (weekly_bias, zone, SMT, window, FVG) at all -- those
+# concepts don't apply to mean reversion. Still enforces: real account drawdown status,
+# real news blackout calendar, and market-open/weekend checks.
 #
-# Per-pair profile now has three independent settings:
-#   trend_required:  must weekly/4H bias match direction to score those points?
-#   zone_required:   is premium/discount zone a HARD STOP, or just informational?
-#   window_required: must this pair only be evaluated inside its Silver Bullet window,
-#                     or can it be scanned continuously, any hour, any day?
+# v6.2 CHANGE (kept): weights reverted to original v5.0 best-backtested values
+# (weekly_bias=25, bias_4h=20, smt=15, price_action_5m=20, threshold=85), FVG/OB no
+# longer a hard requirement for the ICT engine specifically -- backtested across 16
+# months, dropping it took the best ICT result from 65 trades/+$3,381.64 to
+# 234 trades/+$8,567.35.
+#
+# v5.0 CHANGE (kept): `window_required` in PAIR_PROFILES -- DE40/XAUUSD/EURUSD scan
+# continuously for the ICT engine specifically. GBPUSD/USTEC/US30/US500 keep
+# window-gated behavior. (Mean reversion, added in v7.0, ignores this entirely -- it
+# scans all 7 pairs continuously, unrelated to Silver Bullet windows.)
 
 from datetime import datetime, time as dtime
 import pytz
@@ -28,27 +37,27 @@ CET = pytz.timezone('Europe/Prague')
 # ── ACCOUNT ──
 INITIAL_CAPITAL = 10000
 DAILY_LOSS_PCT = 0.03
-MAX_LOSS_PCT = 0.10
+MAX_LOSS_PCT = 0.09   # tightened from FTMO's real 0.10 -- see v7.0 note above
 
+# ── ICT ENGINE PARAMETERS ──
 PAIR_RISK = {
     'XAUUSD': 200, 'EURUSD': 200, 'GBPUSD': 200,
     'USTEC': 200, 'US30': 100, 'US500': 100, 'DE40': 100,
 }
 
-# dollars per point per 1.0 lot -- VERIFIED directly on FTMO demo, July 2026.
 POINT_VALUES = {
     'EURUSD': 1.00, 'GBPUSD': 1.00, 'XAUUSD': 1.00,
     'USTEC': 1.00, 'US30': 1.00, 'US500': 1.00,
     'DE40': 1.15,   # EUR-denominated, drifts with EUR/USD -- re-verify periodically
 }
+POINT_SCALE = {'EURUSD': 100000, 'GBPUSD': 100000, 'XAUUSD': 100,
+                'USTEC': 1, 'US30': 1, 'US500': 1, 'DE40': 1}
 MIN_LOT = 0.01
 MAX_LOT = 1.00
 
 def get_account_for_pair(pair):
     return 'FTMO Account'
 
-# ── PER-PAIR STRATEGY PROFILES ──
-# Backed by a full 16-month backtest across every combination tested. Not guesses.
 PAIR_PROFILES = {
     'EURUSD': {'trend_required': True,  'zone_required': True,  'window_required': False},
     'GBPUSD': {'trend_required': True,  'zone_required': True,  'window_required': True},
@@ -63,7 +72,9 @@ DEFAULT_PROFILE = {'trend_required': True, 'zone_required': True, 'window_requir
 def get_pair_profile(pair):
     return PAIR_PROFILES.get(pair, DEFAULT_PROFILE)
 
-# ── KILL SWITCH ──
+# ── KILL SWITCH (shared logic, used with SEPARATE counters per strategy -- ICT, mean
+# reversion, and manual trades each get their own consecutive_losses tracking, so a bad
+# streak in one doesn't wrongly pause a different one) ──
 MAX_CONSECUTIVE_LOSSES = 3
 KILL_SWITCH_HOURS = 24
 
@@ -84,7 +95,7 @@ def check_kill_switch(consecutive_losses, last_loss_timestamp=None, now_override
     return {'triggered': False, 'reason': f"{consecutive_losses} consecutive losses (threshold {MAX_CONSECUTIVE_LOSSES}).",
             'consecutive_losses': consecutive_losses}
 
-# ── FTMO-SPECIFIC DRAWDOWN LOGIC ──
+# ── FTMO-SPECIFIC DRAWDOWN LOGIC (account-wide, shared by every strategy) ──
 def get_cet_day_boundary(dt_wat):
     return dt_wat.astimezone(CET).date()
 
@@ -119,7 +130,7 @@ def check_best_day_rule(daily_pnl_by_date):
             'reason': f"Best day is {pct:.1f}% of positive-day profit "
                       f"({'OK' if compliant else 'need more profitable days before this counts toward passing'})"}
 
-# ── NEWS CHECK ──
+# ── NEWS CHECK (shared, hard requirement for every strategy) ──
 def check_news_status():
     from news import check_economic_calendar_blackout
     now_utc = datetime.now(WAT).astimezone(pytz.UTC)
@@ -131,7 +142,7 @@ def check_news_status():
             return {'can_trade': True, 'category': 2, 'reason': calendar_check['reason'], 'caution': True}
     return {'can_trade': True, 'category': 3, 'reason': 'No scheduled high/medium impact events nearby', 'caution': False}
 
-# ── SESSIONS (WAT) ──
+# ── SESSIONS (ICT engine only -- mean reversion ignores this entirely) ──
 SILVER_BULLET_WINDOWS = {
     'Asian KZ':       {'pair': 'EURUSD/GBPUSD/XAUUSD', 'start': dtime(0, 0),  'end': dtime(1, 0)},
     'London Open KZ': {'pair': 'EURUSD/GBPUSD/XAUUSD/DE40', 'start': dtime(8, 0),  'end': dtime(9, 0)},
@@ -157,7 +168,7 @@ def is_friday_close(now_override=None):
     now = now_override if now_override else datetime.now(WAT)
     return now.weekday() == 4 and now.hour >= 22
 
-# ── POSITION SIZING ──
+# ── POSITION SIZING (ICT engine) ──
 def calculate_lot_size(pair, sl_points):
     if sl_points <= 0:
         return {'valid': False, 'reason': 'SL distance must be greater than zero'}
@@ -183,7 +194,7 @@ def verify_rr_ratio(sl_points, tp_points):
         return {'valid': False, 'actual_ratio': round(actual_ratio, 2), 'reason': f'R:R is 1:{round(actual_ratio,2)} -- minimum is 1:2'}
     return {'valid': True, 'actual_ratio': round(actual_ratio, 2), 'reason': f'R:R verified: 1:{round(actual_ratio,2)}'}
 
-# ── CONFIDENCE SCORING ──
+# ── CONFIDENCE SCORING (ICT engine) ──
 RULE_WEIGHTS = {
     'account_status': 0, 'news_check': 10, 'market_open': 0, 'silver_bullet_window': 0, 'zone': 0,
     'weekly_bias': 25, 'bias_4h': 20, 'smt': 15, 'price_action_5m': 20, 'rr_ratio': 10,
@@ -216,7 +227,7 @@ def calculate_confidence(results, news_caution=False):
             'meets_threshold': confidence >= MIN_CONFIDENCE, 'scored_rules': scored_rules,
             'news_caution_applied': news_caution}
 
-# ── MAIN FUNCTION ──
+# ── MAIN ICT FUNCTION ──
 def evaluate_checklist(current_equity, daily_floor, max_loss_floor, pair, direction,
                         weekly_bias, bias_4h, sma_50_slope, zone, smt_agreement,
                         smt_divergence, fvg_or_ob, liquidity_swept, bos_confirmed,
@@ -236,8 +247,6 @@ def evaluate_checklist(current_equity, daily_floor, max_loss_floor, pair, direct
     results['market_open'] = {'passed': not weekend and not friday_close,
                                'reason': 'Weekend' if weekend else 'Friday after 22:00 WAT' if friday_close else 'Market open'}
 
-    # window check -- respects the per-pair window_required flag. If False, this pair can be
-    # evaluated any hour, any day (market hours permitting) -- it always "passes" this check.
     if profile['window_required']:
         window = check_silver_bullet_window(now_override)
         results['silver_bullet_window'] = {'passed': window['active'],
@@ -262,8 +271,8 @@ def evaluate_checklist(current_equity, daily_floor, max_loss_floor, pair, direct
     smt_valid = smt_agreement or smt_divergence
     results['smt'] = {'passed': smt_valid, 'reason': 'SMT valid' if smt_valid else 'SMT invalid'}
 
-    price_action_valid = liquidity_swept and bos_confirmed and fvg_or_ob
-    results['price_action_5m'] = {'passed': price_action_valid, 'reason': f'sweep={liquidity_swept} bos={bos_confirmed} fvg={fvg_or_ob}'}
+    price_action_valid = liquidity_swept and bos_confirmed
+    results['price_action_5m'] = {'passed': price_action_valid, 'reason': f'sweep={liquidity_swept} bos={bos_confirmed} (fvg={fvg_or_ob}, no longer required)'}
 
     rr = verify_rr_ratio(sl_points, tp_points)
     results['rr_ratio'] = {'passed': rr['valid'], 'reason': rr['reason']}
@@ -301,4 +310,41 @@ def evaluate_checklist(current_equity, daily_floor, max_loss_floor, pair, direct
         'expected_reward': lot_calc.get('expected_reward') if lot_valid else None,
         'checklist': results, 'confidence_breakdown': confidence['scored_rules'],
         'pair_profile_used': profile,
+    }
+
+
+# ── MEAN REVERSION EVALUATION (v7.0, new) ──
+# Deliberately simpler than the ICT checklist -- no weekly_bias, zone, SMT, window, or
+# FVG concepts apply here. Just the real, hard account-level and compliance checks that
+# genuinely matter for ANY strategy trading this account, plus basic sizing sanity.
+def evaluate_mean_reversion_signal(current_equity, daily_floor, max_loss_floor, pair,
+                                     direction, sl_dist, point_scale, point_value,
+                                     now_override=None):
+    import mean_reversion as mr
+    results = {}
+
+    acc_status = check_account_status(current_equity, daily_floor, max_loss_floor)
+    results['account_status'] = {'passed': acc_status['can_trade'], 'reason': acc_status['reason']}
+
+    news_status = check_news_status()
+    results['news_check'] = {'passed': news_status['can_trade'], 'reason': news_status['reason'],
+                              'caution': news_status.get('caution', False)}
+
+    weekend = is_weekend(now_override)
+    friday_close = is_friday_close(now_override)
+    results['market_open'] = {'passed': not weekend and not friday_close,
+                               'reason': 'Weekend' if weekend else 'Friday after 22:00 WAT' if friday_close else 'Market open'}
+
+    lot_calc = mr.calculate_mr_lot_size(pair, sl_dist, point_scale, point_value)
+    results['lot_size'] = {'valid': lot_calc['valid'], 'details': lot_calc}
+
+    hard_stops = [results['account_status']['passed'], results['market_open']['passed'],
+                  results['news_check']['passed'], lot_calc['valid']]
+    all_passed = all(hard_stops)
+
+    return {
+        'valid': all_passed, 'pair': pair, 'direction': direction,
+        'lot_size': lot_calc.get('lot_size') if lot_calc['valid'] else None,
+        'risk_amount': lot_calc.get('risk_amount') if lot_calc['valid'] else None,
+        'checklist': results,
     }
